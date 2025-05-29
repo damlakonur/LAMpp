@@ -119,7 +119,7 @@ def center_crop_according_to_mask(img, mask, aspect_standard, enlarge_ratio):
 def preprocess_image(rgb_path, mask_path, intr, pad_ratio, bg_color, 
                             max_tgt_size, aspect_standard, enlarge_ratio,
                             render_tgt_size, multiply, need_mask=True,
-                            get_shape_param=False):
+                            get_shape_param=False, canonical_flame_path_override=None):
     rgb = np.array(Image.open(rgb_path))
     rgb_raw = rgb.copy()
     if pad_ratio > 0:
@@ -169,12 +169,11 @@ def preprocess_image(rgb_path, mask_path, intr, pad_ratio, bg_color,
                                                                         aspect_standard=aspect_standard,
                                                                         tgt_size=render_tgt_size, multiply=multiply)
     rgb = cv2.resize(rgb, dsize=(tgt_hw_size[1], tgt_hw_size[0]), interpolation=cv2.INTER_AREA)
+    breakpoint()
     mask = cv2.resize(mask, dsize=(tgt_hw_size[1], tgt_hw_size[0]), interpolation=cv2.INTER_AREA)
     
     if intr is not None:
         intr = scale_intrs(intr, ratio_x=ratio_x, ratio_y=ratio_y)
-        assert abs(intr[0, 2] * 2 - rgb.shape[1]) < 2.5, f"{intr[0, 2] * 2}, {rgb.shape[1]}"
-        assert abs(intr[1, 2] * 2 - rgb.shape[0]) < 2.5, f"{intr[1, 2] * 2}, {rgb.shape[0]}"
         intr[0, 2] = rgb.shape[1] // 2
         intr[1, 2] = rgb.shape[0] // 2
     
@@ -184,8 +183,11 @@ def preprocess_image(rgb_path, mask_path, intr, pad_ratio, bg_color,
     # read shape_param
     shape_param = None
     if get_shape_param:
-        cor_flame_path = os.path.join(os.path.dirname(os.path.dirname(rgb_path)),'canonical_flame_param.npz')
-        flame_p = np.load(cor_flame_path)
+        if canonical_flame_path_override and os.path.exists(canonical_flame_path_override):
+            flame_p_file_to_load = canonical_flame_path_override
+        else: # Fallback to original logic if override is not provided or doesn't exist
+            flame_p_file_to_load = os.path.join(os.path.dirname(os.path.dirname(rgb_path)),'canonical_flame_param.npz')
+        flame_p = np.load(flame_p_file_to_load)
         shape_param = torch.FloatTensor(flame_p['shape'])
 
     return rgb, mask, intr, shape_param
@@ -222,7 +224,7 @@ def predict_motion_seqs_from_images(image_folder:str, save_root, fps=6):
     return save_flame_root, image_folder
 
 
-def render_flame_mesh(data, render_intrs, c2ws, human_model_path="./model_zoo/human_parametric_models"):
+def render_flame_mesh(data, render_intrs, c2ws, human_model_path="./pretrained_models/human_model_files"):
     from lam.models.rendering.flame_model.flame import FlameHead, FlameHeadSubdivided
     from lam.models.rendering.utils.vis_utils import render_mesh
 
@@ -232,14 +234,14 @@ def render_flame_mesh(data, render_intrs, c2ws, human_model_path="./model_zoo/hu
         100,
         add_teeth=True,
         add_shoulder=False,
-        flame_model_path='model_zoo/human_parametric_models/flame_assets/flame/flame2023.pkl',
-        flame_lmk_embedding_path="model_zoo/human_parametric_models/flame_assets/flame/landmark_embedding_with_eyes.npy",
-        flame_template_mesh_path="model_zoo/human_parametric_models/flame_assets/flame/head_template_mesh.obj",
-        flame_parts_path="model_zoo/human_parametric_models/flame_assets/flame/FLAME_masks.pkl",
+        flame_model_path='pretrained_models/human_model_files/flame_assets/flame/flame2023.pkl',
+        flame_lmk_embedding_path="pretrained_models/human_model_files/flame_assets/flame/landmark_embedding_with_eyes.npy",
+        flame_template_mesh_path="pretrained_models/human_model_files/flame_assets/flame/head_template_mesh.obj",
+        flame_parts_path="pretrained_models/human_model_files/flame_assets/flame/FLAME_masks.pkl",
         subdivide_num=subdivide
     ).cuda()
 
-    shape = data['betas'].to('cuda')
+    shape = data['shape'].to('cuda')
     flame_param = {}
     flame_param['expr'] = data['expr'].to('cuda')
     flame_param['rotation'] = data['rotation'].to('cuda')

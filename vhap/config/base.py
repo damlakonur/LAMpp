@@ -42,7 +42,7 @@ class DataConfig(Config):
     subset: Optional[str] = None
     calibrated: bool = False
     """Whether the cameras parameters are available"""
-    align_cameras_to_axes: bool = True
+    align_cameras_to_axes: bool = False
     """Adjust how cameras distribute in the space with a global rotation"""
     camera_convention_conversion: str = 'opencv->opengl'
     target_extrinsic_type: Literal['w2c', 'c2w'] = 'w2c'

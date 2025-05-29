@@ -21,11 +21,12 @@ import trimesh
 import numpy as np
 from PIL import Image
 from glob import glob
+import cv2
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from accelerate.logging import get_logger
 
-from lam.runners.infer.head_utils import prepare_motion_seqs, preprocess_image
+from lam.runners.infer.head_utils import prepare_motion_seqs, preprocess_image, load_flame_params, render_flame_mesh
 
 
 from .base_inferrer import Inferrer
@@ -36,8 +37,8 @@ from lam.utils.video import images_to_video
 from lam.utils.hf_hub import wrap_model_hub
 from lam.models.modeling_lam import ModelLAM
 from safetensors.torch import load_file
-import moviepy.editor as mpy
-from tools.flame_tracking_single_image import FlameTrackingSingleImage
+from lam.dataset import env_paths
+from lam.dataset.cafca_lam_dataset import CafcaLamDataset
 
 
 logger = get_logger(__name__)
@@ -78,9 +79,14 @@ def parse_configs():
         cfg.setdefault("image_dump", os.path.join("exps", cli_cfg.model_name, 'images'))
         cfg.setdefault('video_dump', os.path.join("dumps", cli_cfg.model_name, 'videos'))
         cfg.setdefault('mesh_dump', os.path.join("dumps", cli_cfg.model_name, 'meshes'))
+        
     
     cfg.motion_video_read_fps = 6
     cfg.merge_with(cli_cfg)
+    cfg.setdefault('use_cafca_dataset', False)
+    cfg.setdefault('cafca_subject_id_for_single_infer', None) # e.g., 30
+    cfg.setdefault('cafca_camera_id_for_single_infer', None)  # e.g., "C02"
+    cfg.setdefault('cafca_driving_camera_id_for_single', None)  # e.g., "C02"
 
     """
     [required]
@@ -108,7 +114,7 @@ def parse_configs():
 
     # assert not (args.config is not None and args.infer is not None), "Only one of config and infer should be provided"
     assert cfg.model_name is not None, "model_name is required"
-    if not os.environ.get('APP_ENABLED', None):
+    if not os.environ.get('APP_ENABLED', None) and not cfg.get('use_cafca_dataset', False):
         assert cfg.image_input is not None, "image_input is required"
         assert cfg.export_video or cfg.export_mesh, \
             "At least one of export_video or export_mesh should be True"
@@ -137,14 +143,23 @@ class LAMInferrer(Inferrer):
 
         self.model: LAMInferrer = self._build_model(self.cfg).to(self.device)
 
-        self.flametracking = FlameTrackingSingleImage(output_dir='tracking_output',
-                                             alignment_model_path='./model_zoo/flame_tracking_models/68_keypoints_model.pkl',
-                                             vgghead_model_path='./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd',
-                                             human_matting_path='./model_zoo/flame_tracking_models/matting/stylematte_synth.pt',
-                                             facebox_model_path='./model_zoo/flame_tracking_models/FaceBoxesV2.pth',
-                                             detect_iris_landmarks=True,
-                                             args = self.cfg)
+        # self.flametracking = FlameTrackingSingleImage(output_dir='tracking_output',
+        #                                      alignment_model_path='./pretrain_model/68_keypoints_model.pkl',
+        #                                      vgghead_model_path='./pretrain_model/vgghead/vgg_heads_l.trcd',
+        #                                      human_matting_path='./pretrain_model/matting/stylematte_synth.pt',
+        #                                      facebox_model_path='./pretrain_model/FaceBoxesV2.pth',
+        #                                      detect_iris_landmarks=True,
+        #                                      args = self.cfg)
 
+        self.cafca_loader = None
+        if self.cfg.get('use_cafca_dataset', False):
+            logger.info("Initializing CafcaLamDataset for LAM inference.")
+            if not hasattr(env_paths, 'subjects_train') or not env_paths.subjects_train:
+                raise ValueError("env_paths.subjects_train is not defined or is empty. Please set it for CafcaLamDataset.")
+            self.cafca_dataset = CafcaLamDataset(subject_list=env_paths.subjects_train, mode="lam_infer")
+            self.cafca_loader = torch.utils.data.DataLoader(
+                self.cafca_dataset, batch_size=1, shuffle=False, num_workers=0 # Batch size 1 for inference
+            )
 
     def _build_model(self, cfg):
         """
@@ -208,40 +223,6 @@ class LAMInferrer(Inferrer):
         assert N == planes.shape[0]
         return planes
 
-    def infer_video(self, planes: torch.Tensor, frame_size: int, render_size: int, render_views: int, render_fps: int, dump_video_path: str):
-        N = planes.shape[0]
-        render_cameras = self._default_render_cameras(n_views=render_views, batch_size=N, device=self.device)
-        render_anchors = torch.zeros(N, render_cameras.shape[1], 2, device=self.device)
-        render_resolutions = torch.ones(N, render_cameras.shape[1], 1, device=self.device) * render_size
-        render_bg_colors = torch.ones(N, render_cameras.shape[1], 1, device=self.device, dtype=torch.float32) * 0. # 1.
-
-        frames = []
-        for i in range(0, render_cameras.shape[1], frame_size):
-            frames.append(
-                self.model.synthesizer(
-                    planes=planes,
-                    cameras=render_cameras[:, i:i+frame_size],
-                    anchors=render_anchors[:, i:i+frame_size],
-                    resolutions=render_resolutions[:, i:i+frame_size],
-                    bg_colors=render_bg_colors[:, i:i+frame_size],
-                    region_size=render_size,
-                )
-            )
-        # merge frames
-        frames = {
-            k: torch.cat([r[k] for r in frames], dim=1)
-            for k in frames[0].keys()
-        }
-        # dump
-        os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
-        for k, v in frames.items():
-            if k == 'images_rgb':
-                images_to_video(
-                    images=v[0],
-                    output_path=dump_video_path,
-                    fps=render_fps,
-                    gradio_codec=self.cfg.app_enabled,
-                )
 
     def infer_mesh(self, planes: torch.Tensor, mesh_size: int, mesh_thres: float, dump_mesh_path: str):
         grid_out = self.model.synthesizer.forward_grid(
@@ -278,6 +259,11 @@ class LAMInferrer(Inferrer):
         print(f"Video saved successfully at {v_pth}")
     
     def infer_single(self, image_path: str,
+                     mask_path_for_preprocess: str, # Path to the 1024x1024 mask
+                     intrinsics_for_preprocess: np.ndarray, # Adjusted intrinsics for 1024x1024 image
+                     target_intrinsics: np.ndarray, # Intrinsics for the target image
+                     canonical_flame_path_for_subject: str, # Path to subject's canonical_flame_param.npz
+                     cam2world: np.ndarray, # Camera to canonical flame transformation
                      motion_seqs_dir, 
                      motion_img_dir,
                      motion_video_read_fps,
@@ -286,8 +272,7 @@ class LAMInferrer(Inferrer):
                      dump_tmp_dir:str,  # require by extracting motion seq from video, to save some results
                      dump_image_dir:str,
                      dump_video_path: str, 
-                     dump_mesh_path: str,
-                     gaga_track_type: str):
+                     dump_mesh_path: str):
         source_size = self.cfg.source_size
         render_size = self.cfg.render_size
         render_fps = self.cfg.render_fps
@@ -298,40 +283,46 @@ class LAMInferrer(Inferrer):
         save_img = self.cfg.get("save_img", False)  # False
         rendered_bg = 1.
         ref_bg = 1.
-        mask_path = image_path.replace("/images/", "/fg_masks/").replace(".jpg", ".png")
-        if ref_bg < 1.:
-            if "VFHQ_TEST" in image_path:
-                mask_path = image_path.replace("/VFHQ_TEST/", "/mask/").replace("/images/", "/mask/").replace(".png", ".jpg")
-            else:
-                mask_path = image_path.replace("/vfhq_test_nooffset_export/", "/mask/").replace("/images/", "/mask/").replace(".png", ".jpg")
-        if not os.path.exists(mask_path):
-            print("Warning: Mask path not exists:", mask_path)
-            mask_path = None
+        if not os.path.exists(mask_path_for_preprocess):
+            logger.warning(f"Mask for preprocess_image not found: {mask_path_for_preprocess}. Relying on rembg if need_mask=True.")
+            effective_mask_path = None
         else:
-            print("load mask from:", mask_path)
+            effective_mask_path = mask_path_for_preprocess
 
-        image, _, _, shape_param = preprocess_image(image_path, mask_path=mask_path, intr=None, pad_ratio=0, bg_color=ref_bg, 
+        image, _, final_intrinsics, shape_param = preprocess_image(image_path, mask_path=effective_mask_path, 
+                                             intr=intrinsics_for_preprocess, pad_ratio=0, bg_color=ref_bg, 
                                              max_tgt_size=None, aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1.0],
-                                             render_tgt_size=source_size, multiply=14, need_mask=True, get_shape_param=True)
+                                             render_tgt_size=source_size, multiply=14, need_mask=True, get_shape_param=True, canonical_flame_path_override=canonical_flame_path_for_subject)
         # save masked image for vis
         save_ref_img_path = os.path.join(dump_tmp_dir, "refer_" + os.path.basename(image_path))
-        vis_ref_img = (image[0].permute(1, 2 ,0).cpu().detach().numpy() * 255).astype(np.uint8)
-        Image.fromarray(vis_ref_img).save(save_ref_img_path)
-        # prepare motion seq
-        test_sample=self.cfg.get("test_sample", False)
-        # test_sample=True
-        src = image_path.split('/')[-3]
-        driven = motion_seqs_dir.split('/')[-2]
-        src_driven = [src, driven]
-        motion_seq = prepare_motion_seqs(motion_seqs_dir, motion_img_dir, save_root=dump_tmp_dir, fps=motion_video_read_fps,
-                                            bg_color=rendered_bg, aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1,0],
-                                            render_image_res=render_size,  multiply=16, 
-                                            need_mask=motion_img_need_mask, vis_motion=vis_motion, 
-                                            shape_param=shape_param, test_sample=test_sample, cross_id=self.cfg.get("cross_id", False), src_driven=src_driven)
+        # vis_ref_img = (image[0].permute(1, 2 ,0).cpu().detach().numpy() * 255).astype(np.uint8)
+        # Image.fromarray(vis_ref_img).save(save_ref_img_path)
+        # # prepare motion seq
+        # test_sample=self.cfg.get("test_sample", False)
+ 
+        # motion_seq = prepare_motion_seqs(motion_seqs_dir, motion_img_dir, save_root=dump_tmp_dir, fps=motion_video_read_fps,
+        #                                     bg_color=rendered_bg, aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1,0],
+        #                                     render_image_res=render_size,  multiply=16, 
+        #                                     need_mask=motion_img_need_mask, vis_motion=vis_motion, 
+        #                                     shape_param=shape_param, test_sample=test_sample, cross_id=self.cfg.get("cross_id", False), src_driven=["", ""])
 
-        # return
 
-        motion_seq["flame_params"]["betas"] = shape_param.unsqueeze(0)
+        # motion_seq["flame_params"]["betas"] = shape_param.unsqueeze(0)
+        # Image.fromarray(vis_ref_img).save(save_ref_img_path)
+        render_c2ws_single = torch.from_numpy(cam2world).float().unsqueeze(0).unsqueeze(1)
+        render_intrs_single = torch.from_numpy(final_intrinsics).float().unsqueeze(0).unsqueeze(1)
+        rendered_bg_colors = torch.ones((1, 1, 3), dtype=torch.float32)
+        flame_params = load_flame_params(canonical_flame_path_for_subject)
+        flame_params["betas"] = shape_param.unsqueeze(0)
+        # Reshape pose/expression parameters to be [B, N_source, N_coeffs] = [1, 1, N_coeffs]
+        # to match the expectations of infer_single_view.
+        params_to_reshape = ['expr', 'rotation', 'neck_pose', 'jaw_pose', 'eyes_pose', 'translation']
+        for p_key in params_to_reshape:
+            if p_key in flame_params: # Check if key exists (it should from load_flame_params)
+                flame_params[p_key] = flame_params[p_key].unsqueeze(0).unsqueeze(0)
+        # motion_render = render_flame_mesh(flame_params, render_intrs_single, render_c2ws_single)
+            
+        
         start_time = time.time()
         device="cuda"
         dtype=torch.float32
@@ -341,23 +332,22 @@ class LAMInferrer(Inferrer):
         with torch.no_grad():
             # TODO check device and dtype
             res = self.model.infer_single_view(image.unsqueeze(0).to(device, dtype), None, None, 
-                                               render_c2ws=motion_seq["render_c2ws"].to(device),
-                                               render_intrs=motion_seq["render_intrs"].to(device),
-                                               render_bg_colors=motion_seq["render_bg_colors"].to(device),
-                                               flame_params={k:v.to(device) for k, v in motion_seq["flame_params"].items()})
+                                               render_c2ws=render_c2ws_single.to(device),
+                                               render_intrs=render_intrs_single.to(device),
+                                               render_bg_colors=rendered_bg_colors.to(device),
+                                               flame_params={k:v.to(device) for k, v in flame_params.items()})
 
         print(f"time elapsed: {time.time() - start_time}")
         rgb = res["comp_rgb"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
         rgb = (np.clip(rgb, 0, 1.0) * 255).astype(np.uint8)
-        only_pred = rgb
+        only_pred = rgb.copy()
         if vis_motion:
             # print(rgb.shape, motion_seq["vis_motion_render"].shape)
-            import cv2
             vis_ref_img = np.tile(cv2.resize(vis_ref_img, (rgb[0].shape[1], rgb[0].shape[0]), interpolation=cv2.INTER_AREA)[None, :, :, :], (rgb.shape[0], 1, 1, 1))
             blend_ratio = 0.7
-            blend_res = ((1 -  blend_ratio) * rgb + blend_ratio * motion_seq["vis_motion_render"]).astype(np.uint8)
+            # blend_res = ((1 -  blend_ratio) * rgb + blend_ratio * motion_seq["vis_motion_render"]).astype(np.uint8)
             # rgb = np.concatenate([rgb, motion_seq["vis_motion_render"], blend_res, vis_ref_img], axis=2)
-            rgb = np.concatenate([vis_ref_img, rgb, motion_seq["vis_motion_render"]], axis=2)
+            rgb = np.concatenate([vis_ref_img, rgb, motion_render], axis=2)
             
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
         # images_to_video(rgb, output_path=dump_video_path, fps=render_fps, gradio_codec=False, verbose=True)
@@ -415,60 +405,86 @@ class LAMInferrer(Inferrer):
     def infer(self):
         image_paths = []
         # hard code
-        if os.path.isfile(self.cfg.image_input):
-            omit_prefix = os.path.dirname(self.cfg.image_input)
-            image_paths = [self.cfg.image_input]
-        else:
-            # ids = sorted(os.listdir(self.cfg.image_input))
-            # image_paths = [os.path.join(self.cfg.image_input, e, "images/00000_00.png") for e in ids]
-            image_paths = glob(os.path.join(self.cfg.image_input, "*.jpg"))
-            omit_prefix = self.cfg.image_input
+        # if os.path.isfile(self.cfg.image_input):
+        #     omit_prefix = os.path.dirname(self.cfg.image_input)
+        #     image_paths = [self.cfg.image_input]
+        # else:
+        #     # ids = sorted(os.listdir(self.cfg.image_input))
+        #     # image_paths = [os.path.join(self.cfg.image_input, e, "images/00000_00.png") for e in ids]
+        #     image_paths = glob(os.path.join(self.cfg.image_input, "*.png"))
+        #     omit_prefix = self.cfg.image_input
+        if self.cafca_loader is not None and self.cfg.get('use_cafca_dataset', False):
+            logger.info("Inferring using CafcaLamDataset.")
+            input_source_is_cafca = True
+        elif os.path.isfile(self.cfg.image_input):
+            logger.info(f"Inferring using single image_input: {self.cfg.image_input}")
+            input_source_is_cafca = False
+        if input_source_is_cafca and self.cfg.get('cafca_subject_id_for_single_infer') is not None and self.cfg.get('cafca_camera_id_for_single_infer') is not None and self.cfg.get('cafca_driving_camera_id_for_single') is not None:
+            target_subject_id = int(self.cfg.cafca_subject_id_for_single_infer)
+            target_cam_id = self.cfg.cafca_camera_id_for_single_infer
+            logger.info(f"Attempting to find specific CAFCA item: Subject ID {target_subject_id}, Camera ID {target_cam_id}")
+            target_driving_cam_id = self.cfg.cafca_driving_camera_id_for_single
+            
+            found_item = None
+            found_driving_item = None
+            for item in self.cafca_dataset.data: # Accessing internal list directly for searching
+                if item["subject_id_int"] == target_subject_id and item["cam_id"] == target_cam_id:
+                    found_item = item
+                if item["subject_id_int"] == target_subject_id and item["cam_id"] == target_driving_cam_id:
+                    found_driving_item = item
+            if found_item is None:
+                logger.error(f"Could not find CAFCA item for Subject ID {target_subject_id}, Camera ID {target_cam_id}. Exiting.")
+                return
+            iterable_data_for_loop = [{k: [v] for k,v in found_item.items()}]
 
-        gaga_track_type = ""
+        target_cam2world = found_driving_item["cam_2_world"]
+        target_intrinsics = found_driving_item["intrinsic"]
+        if isinstance(target_cam2world, torch.Tensor):
+            target_cam2world = target_cam2world.cpu().numpy()
+        breakpoint()
+            
+        
 
-        for image_path in tqdm(image_paths, disable=not self.accelerator.is_local_main_process):
+        for data_item_batch in tqdm(iterable_data_for_loop, disable=not self.accelerator.is_local_main_process):
             try:
-
-                # preprocess input image: segmentation, flame params estimation
-                return_code = self.flametracking.preprocess(image_path)
-                assert (return_code == 0), "flametracking preprocess failed!"
-                return_code = self.flametracking.optimize()
-                assert (return_code == 0), "flametracking optimize failed!"
-                return_code, output_dir = self.flametracking.export()
-                assert (return_code == 0), "flametracking export failed!"
-
-                image_path = os.path.join(output_dir, "images/00000_00.png")
-                # mask_path = image_path.replace("/images/", "/fg_masks/").replace(".jpg", ".png")
+                if input_source_is_cafca:
+                    # Item from CafcaLamDataset DataLoader (batch size 1)
+                    ref_preprocessed_image_path = data_item_batch["image_file_path"][0]
+                    ref_preprocessed_mask_path = data_item_batch["mask_file_path"][0]
+                    # Intrinsics are already numpy arrays from CafcaLamDataset
+                    ref_adjusted_intrinsics_np = data_item_batch["intrinsic"][0] 
+                    ref_canonical_flame_path = data_item_batch["canonical_flame_param_path"][0]
+                    subject_id_str_ref = data_item_batch["subject_id_str"][0]
+                    cam_id_ref = data_item_batch["cam_id"][0]
+                    ref_cam2world = data_item_batch["cam_2_world"][0]
+                    if isinstance(ref_cam2world, torch.Tensor):
+                        ref_cam2world = ref_cam2world.cpu().numpy()
+                    
+                    
+                    uid = f"{subject_id_str_ref}_{cam_id_ref}"
+                    dump_subdir = subject_id_str_ref
 
                 motion_seqs_dir = self.cfg.motion_seqs_dir
                 print("motion_seqs_dir:", motion_seqs_dir)
-                # prepare dump paths
-                image_name = os.path.basename(image_path)
-                uid = image_name.split('.')[0]
-                subdir_path = os.path.dirname(image_path).replace(omit_prefix, '')
-                subdir_path = subdir_path[1:] if subdir_path.startswith('/') else subdir_path
-                # hard code
-                subdir_path = gaga_track_type
-                uid = os.path.basename(os.path.dirname(os.path.dirname(image_path)))
-                print("subdir_path and uid:", subdir_path, uid)
+
                 dump_video_path = os.path.join(
                     self.cfg.video_dump,
-                    subdir_path,
+                    dump_subdir,
                     f'{uid}.mp4',
                 )
                 dump_image_dir = os.path.join(
                     self.cfg.image_dump,
-                    subdir_path,
+                    dump_subdir,
                     f'{uid}'
                 )
                 dump_tmp_dir = os.path.join(
                     self.cfg.image_dump,
-                    subdir_path,
+                    dump_subdir,
                     "tmp_res"
                 )
                 dump_mesh_path = os.path.join(
                     self.cfg.mesh_dump,
-                    subdir_path,
+                    dump_subdir,
                     # f'{uid}.ply',
                 )
                 os.makedirs(dump_image_dir, exist_ok=True)
@@ -480,7 +496,12 @@ class LAMInferrer(Inferrer):
                 #     continue
 
                 self.infer_single(
-                    image_path,
+                    image_path=ref_preprocessed_image_path, # This is the 1024x1024 image
+                    mask_path_for_preprocess=ref_preprocessed_mask_path,
+                    intrinsics_for_preprocess=ref_adjusted_intrinsics_np,
+                    target_intrinsics=target_intrinsics,
+                    canonical_flame_path_for_subject=ref_canonical_flame_path,
+                    cam2world=target_cam2world,
                     motion_seqs_dir=motion_seqs_dir,
                     motion_img_dir=self.cfg.motion_img_dir,
                     motion_video_read_fps=self.cfg.motion_video_read_fps,
@@ -488,9 +509,8 @@ class LAMInferrer(Inferrer):
                     export_mesh=self.cfg.export_mesh, 
                     dump_tmp_dir=dump_tmp_dir,
                     dump_image_dir=dump_image_dir,
-                    dump_video_path=dump_video_path, 
+                    dump_video_path=dump_video_path,
                     dump_mesh_path=dump_mesh_path,
-                    gaga_track_type=gaga_track_type
                     )
             except:
                 traceback.print_exc()

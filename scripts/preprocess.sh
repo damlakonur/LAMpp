@@ -2,11 +2,11 @@
 
 TRAIN_CONFIG="configs/inference/lam-20k-8gpu.yaml"
 MODEL_NAME="exps/releases/lam/lam-20k/step_045500/"
-IMAGE_INPUT="sh ./scripts/install/install_cu118.sh"
+IMAGE_INPUT="/home/cafca_dataset/00030/00000_000/color_image/C03.png"
 MOTION_SEQS_DIR="assets/sample_motion/export/The_Shawshank_Redemption/"
 CAFCA_SUBJECT_ID_SINGLE="30" # Specify the subject ID for single inference
-CAFCA_CAMERA_ID_SINGLE="C21"  # Specify the camera ID for single inference
-CAFCA_DRIVING_CAMERA_ID_SINGLE="C21"  # Specify the camera ID for single inference
+CAFCA_CAMERA_ID_SINGLE="C17"  # Specify the camera ID for single inference
+CAFCA_DRIVING_CAMERA_ID_SINGLE="C17"  # Specify the camera ID for single inference
 
 
 TRAIN_CONFIG=${1:-$TRAIN_CONFIG}
@@ -41,8 +41,8 @@ nodes=0
 
 export PYTHONPATH=$PYTHONPATH:$pwd
 
-
-CUDA_VISIBLE_DEVICES=$device python -m lam.launch infer.lam --config $TRAIN_CONFIG \
+CUDA_VISIBLE_DEVICES=$device python -m lam.dataset.preprocessor  \
+        --config $TRAIN_CONFIG \
         model_name=$MODEL_NAME image_input=$IMAGE_INPUT \
         use_cafca_dataset=$USE_CAFCA_DATASET \
         cafca_subject_id_for_single_infer=$CAFCA_SUBJECT_ID_SINGLE \
@@ -55,5 +55,4 @@ CUDA_VISIBLE_DEVICES=$device python -m lam.launch infer.lam --config $TRAIN_CONF
         save_ply=$SAVE_PLY save_img=$SAVE_IMG \
         cross_id=$CROSS_ID \
         rank=$device nodes=$nodes
-
         
