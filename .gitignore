@@ -12,3 +12,7 @@ model_zoo/
 tracking_output/
 tracking/
 tracking_results/
+*.npy
+*.npz
+*.txt
+*.png

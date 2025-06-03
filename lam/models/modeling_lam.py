@@ -294,7 +294,8 @@ class ModelLAM(nn.Module):
         assert image.shape[0] == flame_params["betas"].shape[0], "Batch size mismatch for image and flame_params"
         assert image.shape[0] == flame_params["expr"].shape[0], "Batch size mismatch for image and flame_params"
         assert len(flame_params["betas"].shape) == 2
-        render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(render_intrs[0, 0, 0, 2] * 2)
+        # render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(render_intrs[0, 0, 0, 2] * 2)
+        render_h, render_w = 512, 512  # for testing
         assert image.shape[0] == 1
         num_views = render_c2ws.shape[1]
         query_points = None
@@ -310,6 +311,7 @@ class ModelLAM(nn.Module):
                                                 flame_data=flame_params,
                                                 additional_features={"image_feats": image_feats, "image": image[:, 0], "image_feats_bchw": image_feats_bchw})
 
+        #TODO save point cloud
         render_res_list = []
         for view_idx in range(num_views):
             render_res = self.renderer.forward_animate_gs(gs_model_list, 

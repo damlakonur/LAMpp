@@ -32,35 +32,32 @@ class CafcaLamDataset(Dataset):
                 / f"{env_paths.EXPRESSION_ID}_{env_paths.ENVIRONMENT_ID}"
             )
 
-            preprocessed_data_path = subject_base_dir / self.preprocessed_subdir_name
             flame_params_path = subject_base_dir / f"{subject_str_zfill}{env_paths.FLAME_FILENAME}"
             
             # Paths to the preprocessed data components
-            processed_images_dir = preprocessed_data_path / "images"
-            processed_masks_dir = preprocessed_data_path / "masks"
-            processed_cameras_dir = preprocessed_data_path / "cameras_json"
+            masked_images_dir = subject_base_dir / "masked_images"
+            masks_dir = subject_base_dir / "foreground_mask"
+            cameras_dir = subject_base_dir / "cameras_json"
 
             if not flame_params_path.exists():
                 print(f"Warning: Canonical FLAME param file not found for subject {subject_str_zfill} at {flame_params_path}. Skipping subject.")
                 continue
 
-            if not processed_images_dir.exists():
-                print(f"Warning: Preprocessed images directory not found for subject {subject_str_zfill} at {processed_images_dir}. Skipping subject.")
+            if not masked_images_dir.exists():
+                print(f"Warning: Preprocessed images directory not found for subject {subject_str_zfill} at {masked_images_dir}. Skipping subject.")
                 continue
 
-            # Iterate through camera files in the *preprocessed* camera directory
-            # to ensure we only load data for which preprocessing was successful.
-            processed_camera_files = sorted(list(processed_cameras_dir.glob("*.json")))
+            camera_files = sorted(list(cameras_dir.glob("*.json")))
 
-            if not processed_camera_files:
-                print(f"Warning: No preprocessed camera files found for subject {subject_str_zfill} in {processed_cameras_dir}. Skipping subject.")
+            if not camera_files:
+                print(f"Warning: No preprocessed camera files found for subject {subject_str_zfill} in {cameras_dir}. Skipping subject.")
                 continue
 
-            for cam_json_file in processed_camera_files:
+            for cam_json_file in camera_files:
                 cam_id = cam_json_file.stem # e.g., C02
 
-                image_file = processed_images_dir / f"{cam_id}.png"
-                mask_file = processed_masks_dir / f"{cam_id}.png"
+                image_file = masked_images_dir / f"{cam_id}.png"
+                mask_file = masks_dir / f"{cam_id}.png"
 
                 if not image_file.exists():
                     print(f"Warning: Preprocessed image {image_file} not found for subject {subject_str_zfill}, cam {cam_id}. Skipping item.")
@@ -81,9 +78,9 @@ class CafcaLamDataset(Dataset):
                             "subject_id_int": subject_int,
                             "subject_id_str": subject_str_zfill,
                             "cam_id": cam_id,
-                            "image_file_path": str(image_file),  # Path to 1024x1024 preprocessed image
-                            "mask_file_path": str(mask_file),    # Path to 1024x1024 preprocessed mask
-                            "intrinsic": np.array(cam_params["K"]), # Adjusted intrinsics for 1024x1024 image
+                            "image_file_path": str(image_file),  # Path to 512x512 preprocessed image
+                            "mask_file_path": str(mask_file),    # Path to 512x512 preprocessed mask
+                            "intrinsic": np.array(cam_params["K"]), # Original intrinsics for 512x512 image
                             "canonical_flame_param_path": str(flame_params_path),
                             "cam_2_world": np.array(cam_params["cam2world"]), # Camera to canonical flame transformation
                         }

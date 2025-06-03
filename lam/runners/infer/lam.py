@@ -143,14 +143,6 @@ class LAMInferrer(Inferrer):
 
         self.model: LAMInferrer = self._build_model(self.cfg).to(self.device)
 
-        # self.flametracking = FlameTrackingSingleImage(output_dir='tracking_output',
-        #                                      alignment_model_path='./pretrain_model/68_keypoints_model.pkl',
-        #                                      vgghead_model_path='./pretrain_model/vgghead/vgg_heads_l.trcd',
-        #                                      human_matting_path='./pretrain_model/matting/stylematte_synth.pt',
-        #                                      facebox_model_path='./pretrain_model/FaceBoxesV2.pth',
-        #                                      detect_iris_landmarks=True,
-        #                                      args = self.cfg)
-
         self.cafca_loader = None
         if self.cfg.get('use_cafca_dataset', False):
             logger.info("Initializing CafcaLamDataset for LAM inference.")
@@ -259,8 +251,7 @@ class LAMInferrer(Inferrer):
         print(f"Video saved successfully at {v_pth}")
     
     def infer_single(self, image_path: str,
-                     mask_path_for_preprocess: str, # Path to the 1024x1024 mask
-                     intrinsics_for_preprocess: np.ndarray, # Adjusted intrinsics for 1024x1024 image
+                     mask_path_for_preprocess: str, # Path to the original mask
                      target_intrinsics: np.ndarray, # Intrinsics for the target image
                      canonical_flame_path_for_subject: str, # Path to subject's canonical_flame_param.npz
                      cam2world: np.ndarray, # Camera to canonical flame transformation
@@ -289,28 +280,12 @@ class LAMInferrer(Inferrer):
         else:
             effective_mask_path = mask_path_for_preprocess
 
-        image, _, final_intrinsics, shape_param = preprocess_image(image_path, mask_path=effective_mask_path, 
-                                             intr=intrinsics_for_preprocess, pad_ratio=0, bg_color=ref_bg, 
+        image, _, _, shape_param = preprocess_image(image_path, mask_path=effective_mask_path, 
+                                             intr=None, pad_ratio=0, bg_color=ref_bg, 
                                              max_tgt_size=None, aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1.0],
                                              render_tgt_size=source_size, multiply=14, need_mask=True, get_shape_param=True, canonical_flame_path_override=canonical_flame_path_for_subject)
-        # save masked image for vis
-        save_ref_img_path = os.path.join(dump_tmp_dir, "refer_" + os.path.basename(image_path))
-        # vis_ref_img = (image[0].permute(1, 2 ,0).cpu().detach().numpy() * 255).astype(np.uint8)
-        # Image.fromarray(vis_ref_img).save(save_ref_img_path)
-        # # prepare motion seq
-        # test_sample=self.cfg.get("test_sample", False)
- 
-        # motion_seq = prepare_motion_seqs(motion_seqs_dir, motion_img_dir, save_root=dump_tmp_dir, fps=motion_video_read_fps,
-        #                                     bg_color=rendered_bg, aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1,0],
-        #                                     render_image_res=render_size,  multiply=16, 
-        #                                     need_mask=motion_img_need_mask, vis_motion=vis_motion, 
-        #                                     shape_param=shape_param, test_sample=test_sample, cross_id=self.cfg.get("cross_id", False), src_driven=["", ""])
-
-
-        # motion_seq["flame_params"]["betas"] = shape_param.unsqueeze(0)
-        # Image.fromarray(vis_ref_img).save(save_ref_img_path)
         render_c2ws_single = torch.from_numpy(cam2world).float().unsqueeze(0).unsqueeze(1)
-        render_intrs_single = torch.from_numpy(final_intrinsics).float().unsqueeze(0).unsqueeze(1)
+        render_intrs_single = torch.from_numpy(target_intrinsics).float().unsqueeze(0).unsqueeze(1)
         rendered_bg_colors = torch.ones((1, 1, 3), dtype=torch.float32)
         flame_params = load_flame_params(canonical_flame_path_for_subject)
         flame_params["betas"] = shape_param.unsqueeze(0)
@@ -337,6 +312,7 @@ class LAMInferrer(Inferrer):
                                                render_bg_colors=rendered_bg_colors.to(device),
                                                flame_params={k:v.to(device) for k, v in flame_params.items()})
 
+        breakpoint()
         print(f"time elapsed: {time.time() - start_time}")
         rgb = res["comp_rgb"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
         rgb = (np.clip(rgb, 0, 1.0) * 255).astype(np.uint8)
@@ -403,16 +379,6 @@ class LAMInferrer(Inferrer):
             mesh_utils.save_obj(pth, vtxs, faces, textures=colors, texture_type="vertex")
 
     def infer(self):
-        image_paths = []
-        # hard code
-        # if os.path.isfile(self.cfg.image_input):
-        #     omit_prefix = os.path.dirname(self.cfg.image_input)
-        #     image_paths = [self.cfg.image_input]
-        # else:
-        #     # ids = sorted(os.listdir(self.cfg.image_input))
-        #     # image_paths = [os.path.join(self.cfg.image_input, e, "images/00000_00.png") for e in ids]
-        #     image_paths = glob(os.path.join(self.cfg.image_input, "*.png"))
-        #     omit_prefix = self.cfg.image_input
         if self.cafca_loader is not None and self.cfg.get('use_cafca_dataset', False):
             logger.info("Inferring using CafcaLamDataset.")
             input_source_is_cafca = True
@@ -441,7 +407,6 @@ class LAMInferrer(Inferrer):
         target_intrinsics = found_driving_item["intrinsic"]
         if isinstance(target_cam2world, torch.Tensor):
             target_cam2world = target_cam2world.cpu().numpy()
-        breakpoint()
             
         
 
@@ -452,7 +417,6 @@ class LAMInferrer(Inferrer):
                     ref_preprocessed_image_path = data_item_batch["image_file_path"][0]
                     ref_preprocessed_mask_path = data_item_batch["mask_file_path"][0]
                     # Intrinsics are already numpy arrays from CafcaLamDataset
-                    ref_adjusted_intrinsics_np = data_item_batch["intrinsic"][0] 
                     ref_canonical_flame_path = data_item_batch["canonical_flame_param_path"][0]
                     subject_id_str_ref = data_item_batch["subject_id_str"][0]
                     cam_id_ref = data_item_batch["cam_id"][0]
@@ -496,9 +460,8 @@ class LAMInferrer(Inferrer):
                 #     continue
 
                 self.infer_single(
-                    image_path=ref_preprocessed_image_path, # This is the 1024x1024 image
+                    image_path=ref_preprocessed_image_path, # This is the 512x512 image
                     mask_path_for_preprocess=ref_preprocessed_mask_path,
-                    intrinsics_for_preprocess=ref_adjusted_intrinsics_np,
                     target_intrinsics=target_intrinsics,
                     canonical_flame_path_for_subject=ref_canonical_flame_path,
                     cam2world=target_cam2world,
