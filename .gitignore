@@ -16,3 +16,4 @@ tracking_results/
 *.npz
 *.txt
 *.png
+wandb/*

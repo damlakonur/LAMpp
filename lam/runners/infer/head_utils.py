@@ -169,12 +169,10 @@ def preprocess_image(rgb_path, mask_path, intr, pad_ratio, bg_color,
                                                                         aspect_standard=aspect_standard,
                                                                         tgt_size=render_tgt_size, multiply=multiply)
     rgb = cv2.resize(rgb, dsize=(tgt_hw_size[1], tgt_hw_size[0]), interpolation=cv2.INTER_AREA)
-    breakpoint()
     mask = cv2.resize(mask, dsize=(tgt_hw_size[1], tgt_hw_size[0]), interpolation=cv2.INTER_AREA)
-    
     if intr is not None:
         intr = scale_intrs(intr, ratio_x=ratio_x, ratio_y=ratio_y)
-        intr[0, 2] = rgb.shape[1] // 2
+        intr[0, 2] = rgb.shape[1] // 2 # set to 504/2
         intr[1, 2] = rgb.shape[0] // 2
     
     rgb = torch.from_numpy(rgb).float().permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]

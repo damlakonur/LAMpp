@@ -25,6 +25,12 @@ from einops import rearrange, repeat
 from .transformer import TransformerDecoder
 from lam.models.rendering.gs_renderer import GS3DRenderer, PointEmbed
 from diffusers.utils import is_torch_version
+from mediapy import VideoWriter
+from dreifus.trajectory import circle_around_axis
+from dreifus.vector import Vec3
+from tqdm import tqdm
+import os
+from dreifus.matrix import Intrinsics, Pose
 
 logger = get_logger(__name__)
 
@@ -160,6 +166,7 @@ class ModelLAM(nn.Module):
         return x
 
     def forward_encode_image(self, image):
+        image = image.to(dtype=torch.float32)
         # encode image
         if self.training and self.encoder_gradient_checkpointing:
             def create_custom_forward(module):
@@ -213,12 +220,18 @@ class ModelLAM(nn.Module):
         # render_intrs: [B, N_source, 4, 4]
         # render_bg_colors: [B, N_source, 3]
         # flame_params: Dict, e.g., pose_shape: [B, N_source, 21, 3], betas:[B, 100]
+        # print("image shape:", image.shape)  # Expected: [B, N_ref, C, H, W]
+        # print("render_c2ws shape:", render_c2ws.shape)  # Expected: [B, N_render, 4, 4]
+        # print("render_bg_colors shape:", render_bg_colors.shape)  # Expected: [B, N_render, 3]
+        # print("flame_params['betas'] shape:", flame_params["betas"].shape)  # Expected: [B, N_betas]
+        # print("flame_params['expr'] shape:", flame_params["expr"].shape)    # Expected: [B, N_expr]
+        # breakpoint()
         assert image.shape[0] == render_c2ws.shape[0], "Batch size mismatch for image and render_c2ws"
         assert image.shape[0] == render_bg_colors.shape[0], "Batch size mismatch for image and render_bg_colors"
         assert image.shape[0] == flame_params["betas"].shape[0], "Batch size mismatch for image and flame_params"
         assert image.shape[0] == flame_params["expr"].shape[0], "Batch size mismatch for image and flame_params"
         assert len(flame_params["betas"].shape) == 2
-        render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(render_intrs[0, 0, 0, 2] * 2)
+        render_h, render_w = 512, 512
         query_points = None
 
         if self.latent_query_points_type.startswith("e2e_flame"):
@@ -251,32 +264,9 @@ class ModelLAM(nn.Module):
         assert render_results['comp_rgb'].shape[0] in [N, N], "Batch size mismatch for render_results"
         assert render_results['comp_rgb'].shape[1] in [M, M*2], "Number of rendered views should be consistent with render_cameras"
 
-        if self.use_conf_map:
-            b, v = render_images.shape[:2]
-            if self.conf_use_pred_img:
-                render_images = repeat(render_images, "b v c h w -> (b v r) c h w", r=2)
-                pred_images = rearrange(render_results['comp_rgb'].detach().clone(), "b v c h w -> (b v) c h w")
-            else:
-                render_images = rearrange(render_images, "b v c h w -> (b v) c h w")
-                pred_images = None
-            conf_sigma_l1, conf_sigma_percl = self.conf_net(render_images, pred_images)  # Bx2xHxW
-            conf_sigma_l1 = rearrange(conf_sigma_l1, "(b v) c h w -> b v c h w", b=b, v=v)
-            conf_sigma_percl = rearrange(conf_sigma_percl, "(b v) c h w -> b v c h w", b=b, v=v)
-            conf_dict = {
-                "conf_sigma_l1": conf_sigma_l1,
-                "conf_sigma_percl": conf_sigma_percl,
-            }
-        else:
-            conf_dict = {}
-            # self.conf_sigma_l1 = conf_sigma_l1[:,:1]
-            # self.conf_sigma_l1_flip = conf_sigma_l1[:,1:]
-            # self.conf_sigma_percl = conf_sigma_percl[:,:1]
-            # self.conf_sigma_percl_flip = conf_sigma_percl[:,1:]
-
         return {
             'latent_points': latent_points,
             **render_results,
-            **conf_dict,
         }
         
     @torch.no_grad()
@@ -339,3 +329,46 @@ class ModelLAM(nn.Module):
         out['cano_gs_lst'] = gs_model_list
         return out
 
+    def save_video(self, video_path, image, flame_params, intrinsics, render_bg_color, fps=8, seconds=4, resolution=(512, 512)):
+        from tqdm import tqdm
+
+        os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        H, W = resolution
+        total_frames = seconds * fps
+
+        # Generate circular trajectory
+        trajectory = circle_around_axis(
+            total_frames,
+            axis=Vec3(0, 0, -1),
+            up=Vec3(0, 1, 0),
+            move=Vec3(0, 0, 1),
+            distance=0.3,
+        )
+        trajectory3 = circle_around_axis(
+            total_frames,
+            axis=Vec3(0, 0, 1),
+            up=Vec3(0, 1, 0),
+            move=Vec3(1, 0, 0),
+            distance=0.3,
+        )
+
+        render_c2ws = torch.stack(
+            [torch.from_numpy(p).float() for p in trajectory  + trajectory3], dim=0
+        ).unsqueeze(0).to(image.device)
+
+        with VideoWriter(video_path, (W, H), fps=fps) as writer:
+            for i in tqdm(range(total_frames*2), desc="Rendering frames"):
+                res = self.infer_single_view(
+                    image=image,
+                    source_c2ws=None,
+                    source_intrs=None,
+                    render_c2ws=render_c2ws[:, i:i+1],
+                    render_intrs=intrinsics,
+                    render_bg_colors=render_bg_color,
+                    flame_params=flame_params,
+                )
+                rgb = res['comp_rgb'].cpu().numpy()[0]  # [1, H, W, 3]
+                rgb = (rgb * 255).astype(np.uint8)
+                writer.add_image(rgb)
+
+        print(f"Video saved to {video_path}")

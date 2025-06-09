@@ -1,0 +1,78 @@
+experiment:
+  name: "lam_cafca_finetune_renderer_mlp"
+  output_dir: "./exps/finetuned_lam_cafca_renderer_mlp"
+  model_name: "exps/releases/lam/lam-20k/step_045500/"
+
+model:
+  pretrained_model_name_or_path: "/home/dkonur/LAMpp/exps/releases/lam/lam-20k/step_045500/"
+  transformer_dim: 1024
+  transformer_layers: 10
+  transformer_heads: 16
+  transformer_type: "sd3_cond"
+  tf_grad_ckpt: true
+  encoder_grad_ckpt: true
+  encoder_freeze: false
+  encoder_type: 'dinov2_fusion'
+  encoder_model_name: 'dinov2_vitl14_reg'
+  encoder_feat_dim: 1024
+  
+  latent_query_points_type: "e2e_flame"
+  pcl_dim: 1024 
+  
+  human_model_path: "./model_zoo/human_parametric_models/"
+  flame_subdivide_num: 1
+  flame_type: "flame"
+  
+  gs_query_dim: 1024
+  gs_use_rgb: true
+  gs_sh: 3
+  gs_mlp_network_config:
+    activation: "silu"
+    n_hidden_layers: 2
+    n_neurons: 512
+  gs_xyz_offset_max_step: 0.2
+  gs_clip_scaling: 0.01
+  
+  shape_param_dim: 10
+  expr_param_dim: 10
+  
+  fix_opacity: false
+  fix_rotation: false
+  flame_scale: 1.0
+  
+  add_teeth: false
+  teeth_bs_flag: false
+  oral_mesh_flag: false
+  
+  use_mesh_shading: false
+  render_rgb: true
+  decode_with_extra_info: null
+  scale_sphere: false
+
+dataset:
+  cafca_subject_ids_train: [30, 31, 32, 33, 34, 35, 36, 37, 41, 45]
+  cafca_subject_ids_val: [48, 49, 50, 51, 55]
+  num_of_src_views: 1
+  num_of_target_views: 4
+
+training:
+  batch_size: 1
+  num_epochs: 200
+  learning_rate: 1.0e-4
+  device: "cuda"
+  save_every_n_epochs: 1
+  image_size: 512
+  num_workers: 2
+  l1_loss_weight: 1.0
+  finetune_renderer_mlp_only: True
+  validate_every_n_epochs: 10
+  num_val_samples_to_log: 4
+  num_train_samples_to_log: 1
+
+wandb:
+  enabled: True
+  project: "lam-1-view-finetuning"
+  entity: "gr-lampp"
+  run_name: "lam_cafca_finetune_renderer_mlp_test"
+  log_every_n_steps: 10
+  log_train_images_every_n_steps: 10
