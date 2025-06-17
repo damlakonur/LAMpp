@@ -78,7 +78,6 @@ class LamLightningModel(pl.LightningModule):
         return self.model(
             image=model_input_data["image"],
             source_c2ws=model_input_data["source_c2ws"],
-            uid=model_input_data["uid"],
             source_intrs=model_input_data["source_intrs"],
             render_c2ws=model_input_data["render_c2ws"],
             render_intrs=model_input_data["render_intrs"],
@@ -97,7 +96,6 @@ class LamLightningModel(pl.LightningModule):
         model_output = self.model(
             image=model_input_data["image"],
             source_c2ws=model_input_data["source_c2ws"],
-            uid=model_input_data["uid"],
             source_intrs=model_input_data["source_intrs"],
             render_c2ws=model_input_data["render_c2ws"],
             render_intrs=model_input_data["render_intrs"],
@@ -134,7 +132,6 @@ class LamLightningModel(pl.LightningModule):
         model_output = self.model(
             image=model_input_data["image"],
             source_c2ws=model_input_data["source_c2ws"],
-            uid=model_input_data["uid"],
             source_intrs=model_input_data["source_intrs"],
             render_c2ws=model_input_data["render_c2ws"],
             render_intrs=model_input_data["render_intrs"],
