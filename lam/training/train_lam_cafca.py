@@ -13,12 +13,10 @@ import torchvision.utils as vutils
 import wandb
 from omegaconf import OmegaConf, DictConfig
 from safetensors.torch import load_file
-from PIL import Image
 from tqdm import tqdm
 import torch.nn.functional as F
 
-# Ensure the project root is in PYTHONPATH
-project_root = Path(__file__).resolve().parents[2] # Adjust if script moves
+project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
@@ -41,7 +39,7 @@ def get_logger(name, level=logging.INFO):
 logger = get_logger(__name__)
 
 
-def prepare_batch_for_model(batch_from_dataloader, device, cfg_model: DictConfig):
+def prepare_batch_for_model(batch_from_dataloader, device):
     """
     Prepares a batch of data from CafcaLamDataset (already batched by DataLoader)
     for input to ModelLAM. Moves tensors to device and structures them as expected by the model.
@@ -88,7 +86,7 @@ def prepare_batch_for_model(batch_from_dataloader, device, cfg_model: DictConfig
 
     return prepared_batch
 
-def _build_model(cfg, ):
+def _build_model(cfg):
     """
     from lam.models import model_dict
     hf_model_cls = wrap_model_hub(model_dict[self.EXP_TYPE])
@@ -239,23 +237,14 @@ def train(cfg: DictConfig):
                 render_intrs=model_input_data["render_intrs"],
                 flame_params=model_input_data["flame_params"],
                 render_bg_colors=model_input_data["render_bg_colors"]
-                # Add source_masks, driving_masks if your model uses them
             )
-            # Assuming model_output is a dict containing 'comp_rgb' [B, N_render, C, H, W]
-            # and potentially other outputs like 'comp_sil', 'gaussian_params'
             pred_rgb = model_output['comp_rgb'] 
             gt_rgb = model_input_data['gt_render_images']
 
             # Calculate loss
             loss_l1 = l1_loss_fn(pred_rgb, gt_rgb)
             total_loss = cfg.training.l1_loss_weight * loss_l1
-            
-            # Add other losses (e.g., LPIPS) if configured
-            # if cfg.training.get("perceptual_loss_weight", 0.0) > 0:
-            #     loss_lpips = lpips_loss_fn(pred_rgb.clamp(0,1), gt_rgb.clamp(0,1)).mean()
-            #     total_loss += cfg.training.perceptual_loss_weight * loss_lpips
-
-
+        
             total_loss.backward()
             optimizer.step()
 
@@ -271,8 +260,7 @@ def train(cfg: DictConfig):
                     "epoch": epoch + 1,
                     "global_step": global_step
                 }
-                # if cfg.training.get("perceptual_loss_weight", 0.0) > 0:
-                #     log_dict["train/lpips_loss"] = loss_lpips.item()
+
                 wandb.log(log_dict)
             if cfg.wandb.enabled and global_step % cfg.wandb.log_train_images_every_n_steps == 0:
                 num_train_samples_to_log_config = cfg.training.get("num_train_samples_to_log", 1)
@@ -327,26 +315,26 @@ def train(cfg: DictConfig):
                         current_val_loss = l1_loss_fn(val_pred_rgb, val_gt_rgb)
                         val_loss += current_val_loss.item()
 
-                        if cfg.wandb.enabled and logged_images < cfg.training.get("num_val_samples_to_log", 0):
+                        if cfg.wandb.enabled:
                             # Log N_target_views images from the first batch item
                             num_to_log_this_item = min(val_pred_rgb.shape[1], cfg.training.get("num_val_samples_to_log", 0) - logged_images)
                             if num_to_log_this_item > 0:
                                 # Take first item in batch, and up to num_to_log_this_item driving views
                                 log_preds = val_pred_rgb[0, :num_to_log_this_item].clamp(0,1)
                                 log_gts = val_gt_rgb[0, :num_to_log_this_item].clamp(0,1)
-                                log_srcs = val_model_input["image"][0].clamp(0,1) # All source views for this item
+                                log_srcs = val_model_input["image"][0].clamp(0,1)
 
-                                combined_vis = []
-                                for i in range(num_to_log_this_item):
-                                    if i < log_srcs.shape[0]: # If enough source views
-                                        combined_vis.append(log_srcs[i])
-                                    combined_vis.append(log_gts[i])
-                                    combined_vis.append(log_preds[i])
-                                
-                                if combined_vis:
-                                    grid = vutils.make_grid(combined_vis, nrow=3, padding=2, normalize=False) # Src, GT, Pred
-                                    wandb.log({f"val/epoch_{epoch+1}_sample_{val_batch_idx}_view_{i}": wandb.Image(grid)})
-                                logged_images += num_to_log_this_item
+                                vis_val = []
+                                for i in range(actual_samples_to_log):
+                                    # Resize all source images to match target size (e.g., 512x512)
+                                    vis_val = F.interpolate(log_srcs[i], size=(512, 512), mode='bilinear', align_corners=False)  # [N_src, 3, 512, 512]
+                                    vis_val.extend(list(resized_srcs))  # Convert to list of [3, 512, 512] tensors
+
+                                    vis_val.append(F.interpolate(log_gts[i, 0].unsqueeze(0), size=(512, 512), mode='bilinear', align_corners=False).squeeze(0))
+                                    vis_val.append(F.interpolate(log_preds[i, 0].unsqueeze(0), size=(512, 512), mode='bilinear', align_corners=False).squeeze(0))
+
+                                grid = vutils.make_grid(vis_val, nrow=log_srcs.shape[1] + 2, padding=2, normalize=False)
+                                wandb.log({f"val/epoch_{epoch+1}_sample_{val_batch_idx}_view_{i}": wandb.Image(grid)})
                                 
                     except Exception as e:
                         logger.error(f"Error during validation batch {val_batch_idx}: {e}")

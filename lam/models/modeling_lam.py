@@ -239,8 +239,8 @@ class ModelLAM(nn.Module):
                                                                         device=image.device)
 
         additional_features = {}
-                                                          
-        latent_points, image_feats = self.forward_latent_points(image[:, 0], camera=None, query_points=query_points, additional_features=additional_features)  # [B, N, C]
+        with torch.no_grad():                                                
+            latent_points, image_feats = self.forward_latent_points(image[:, 0], camera=None, query_points=query_points, additional_features=additional_features)  # [B, N, C]
 
         additional_features.update({
             "image_feats": image_feats, "image": image[:, 0], 

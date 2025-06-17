@@ -596,6 +596,7 @@ class GS3DRenderer(nn.Module):
                 expr = torch.cat([flame_data['expr'], flame_data['teeth_bs']], dim=-1)
             else:
                 expr = flame_data["expr"]
+            # Bottleneck: FLAME forward
             ret = self.flame_model.animation_forward(v_cano=mean_3d,
                                                 shape=flame_data["betas"].repeat(num_view, 1),
                                                 expr=expr,
