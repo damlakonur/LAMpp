@@ -54,6 +54,8 @@ def prepare_batch_for_model(batch_from_dataloader, device):
     prepared_batch["source_intrs"] = batch_from_dataloader["source_intrs"].to(device).float()  # [B, N_ref, 4, 4]
     if "source_masks" in batch_from_dataloader:
         prepared_batch["source_masks"] = batch_from_dataloader["source_masks"].to(device).float()
+    prepared_batch["image_feats"] = batch_from_dataloader["img_feats"].to(device).float()
+    prepared_batch["latent_points"] = batch_from_dataloader["tokens"].to(device).float()
 
     # Target/Driving data for rendering
     prepared_batch["render_c2ws"] = batch_from_dataloader["driving_c2ws"].to(device).float()  # [B, N_render, 4, 4]

@@ -102,6 +102,8 @@ class CafcaLamDataset(Dataset):
             masked_images_dir = subject_base_dir / "masked_images"
             cameras_dir = subject_base_dir / "cameras_json"
             masks_dir = subject_base_dir / "foreground_mask"
+            tokens_dir = subject_base_dir / "tokens"
+            img_feats_dir = subject_base_dir / "image_feats"
 
             if not flame_params_path.exists():
                 print(f"FLAME param file not found for subject {subject_str_zfill} at {flame_params_path}. Skipping subject.")
@@ -113,6 +115,14 @@ class CafcaLamDataset(Dataset):
             
             if not masks_dir.exists():
                 print(f"Foreground masks directory not found for subject {subject_str_zfill} at {masks_dir}. Skipping subject.")
+                continue
+            
+            if not tokens_dir.exists():
+                print(f"Tokens directory not found for subject {subject_str_zfill} at {tokens_dir}. Skipping subject.")
+                continue
+            
+            if not img_feats_dir.exists():
+                print(f"Image features directory not found for subject {subject_str_zfill} at {img_feats_dir}. Skipping subject.")
                 continue
 
             camera_files = sorted(list(cameras_dir.glob("*.json")))
@@ -126,6 +136,8 @@ class CafcaLamDataset(Dataset):
 
                 image_file = masked_images_dir / f"{cam_id}.png"
                 mask_file = masks_dir / f"{cam_id}.png"
+                token_file = tokens_dir / f"{cam_id}.pt"
+                img_feats_file = img_feats_dir / f"{cam_id}.pt"
                 if not mask_file.exists():
                     print(f"Mask file {mask_file} not found for subject {subject_str_zfill}, cam {cam_id}. Skipping item.")
                     continue
@@ -151,6 +163,8 @@ class CafcaLamDataset(Dataset):
                         "subject_flame_param_path": str(flame_params_path), # Single .npz per subject
                         "cam_2_world_np": np.array(cam_params["cam2world"], dtype=np.float32),
                         "intrinsic_np": np.array(cam_params["K"], dtype=np.float32),
+                        "token_file_path": str(token_file),
+                        "img_feats_file_path": str(img_feats_file),
                     }
                     self.data.append(frame_data)
                 except Exception as e:
@@ -253,20 +267,30 @@ class CafcaLamDataset(Dataset):
             source_frame_indices = [primary_source_idx_in_subject_list]
 
         source_images_list, source_c2ws_list, source_intrs_list, source_cam_ids_list, source_mask_list = [], [], [], [], []
+        source_img_feats_list, source_img_tokens_list = [], []
         for s_idx in source_frame_indices:
             meta = subject_frames_info[s_idx]
-            rgb_img = np.array(Image.open(meta["image_file_path"]))
-            mask_img = np.array(Image.open(meta["mask_file_path"]))
+            # rgb_img = np.array(Image.open(meta["image_file_path"]))
+            # mask_img = np.array(Image.open(meta["mask_file_path"]))
 
-            rgb_tensor, mask_tensor = preprocess_image(
-                rgb_img, mask_img, pad_ratio=0,
-                bg_color=np.array([1.0, 1.0, 1.0]),
-                aspect_standard=1.0, enlarge_ratio=[1.0, 1.0],
-                render_tgt_size=512, multiply=14, need_mask=True
-            )
-            source_images_list.append(rgb_tensor.squeeze(0))
+            # rgb_tensor, mask_tensor = preprocess_image(
+            #     rgb_img, mask_img, pad_ratio=0,
+            #     bg_color=np.array([1.0, 1.0, 1.0]),
+            #     aspect_standard=1.0, enlarge_ratio=[1.0, 1.0],
+            #     render_tgt_size=512, multiply=14, need_mask=True
+            # )
+            source_images_list.append(self._load_image_as_tensor(meta["image_file_path"]))
+            mask_tensor = self._load_image_as_tensor(meta["mask_file_path"])
             source_mask_list.append(mask_tensor.squeeze(0))
             source_c2ws_list.append(torch.from_numpy(meta["cam_2_world_np"]).float())
+            img_feat =  torch.load(meta["img_feats_file_path"])
+            img_token = torch.load(meta["token_file_path"])
+            if img_feat.requires_grad:
+                img_feat = img_feat.detach()
+            if img_token.requires_grad:
+                img_token = img_token.detach()
+            source_img_feats_list.append(img_feat)
+            source_img_tokens_list.append(img_token)
             intr_np = meta["intrinsic_np"]
             intr_torch = torch.eye(4, dtype=torch.float32)
             if intr_np.shape == (3, 3):
@@ -316,6 +340,8 @@ class CafcaLamDataset(Dataset):
             "source_c2ws": torch.stack(source_c2ws_list),
             "source_intrs": torch.stack(source_intrs_list),
             "source_masks": torch.stack(source_mask_list),
+            "img_feats": torch.stack(source_img_feats_list),
+            "tokens": torch.stack(source_img_tokens_list),
             "driving_image": torch.stack(driving_images_list),
             "driving_c2ws": torch.stack(driving_c2ws_list),
             "driving_intrs": torch.stack(driving_intrs_list),
@@ -323,8 +349,8 @@ class CafcaLamDataset(Dataset):
             "source_bg_colors": torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).repeat(len(source_images_list), 1),
             "render_bg_colors": torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).repeat(len(driving_images_list), 1),
             "uid": f"subj{subject_id}_src{''.join(source_cam_ids_list)}_drv{''.join(driving_cam_ids_list)}",
-            "subject_id_int_scalar": subject_id, # Added for easier access to subject ID
-            "source_cam_ids_list_scalar": source_cam_ids_list, # Added for easier access to source cam IDs
+            "subject_id_int_scalar": subject_id,
+            "source_cam_ids_list_scalar": source_cam_ids_list,
         }
 
         out_item['betas'] = subject_flame_params['betas']
@@ -366,6 +392,8 @@ if __name__ == '__main__':
                         print(f"  Source c2ws shape: {item['source_c2ws'].shape}")
                         print(f"  Source intrs shape: {item['source_intrs'].shape}")
                         print(f"  Source FLAME betas shape: {item['betas'].shape}")
+                        print(f"img _feats shape: {item['img_feats'].shape}")
+                        print(f"tokens shape: {item['tokens'].shape}")
 
                     print(f"Number of driving frames: {item['driving_image'].shape[0] if item['driving_image'].nelement() > 0 else 0}")
                     if item['driving_image'].nelement() > 0:

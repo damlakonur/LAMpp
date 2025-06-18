@@ -100,6 +100,8 @@ class LamLightningModel(pl.LightningModule):
             render_c2ws=model_input_data["render_c2ws"],
             render_intrs=model_input_data["render_intrs"],
             flame_params=model_input_data["flame_params"],
+            latent_points=model_input_data.get("latent_points"),
+            image_feats=model_input_data.get("image_feats"),
             render_bg_colors=model_input_data["render_bg_colors"]
         )
         self.time_metrics['model_forward_time'] = time() - start_time
@@ -136,6 +138,8 @@ class LamLightningModel(pl.LightningModule):
             render_c2ws=model_input_data["render_c2ws"],
             render_intrs=model_input_data["render_intrs"],
             flame_params=model_input_data["flame_params"],
+            latent_points=model_input_data.get("latent_points"),
+            image_feats=model_input_data.get("image_feats"),
             render_bg_colors=model_input_data["render_bg_colors"]
         )
         pred_rgb = model_output['comp_rgb']

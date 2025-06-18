@@ -213,7 +213,7 @@ class ModelLAM(nn.Module):
 
         return tokens, image_feats
 
-    def forward(self, image, source_c2ws, source_intrs, render_c2ws, render_intrs, render_bg_colors, flame_params, source_flame_params=None, render_images=None, data=None):
+    def forward(self, image, source_c2ws, source_intrs, render_c2ws, render_intrs, render_bg_colors, flame_params, latent_points, image_feats, source_flame_params=None, render_images=None, data=None):
         # image: [B, N_ref, C_img, H_img, W_img]
         # source_c2ws: [B, N_ref, 4, 4]
         # source_intrs: [B, N_ref, 4, 4]
@@ -234,15 +234,17 @@ class ModelLAM(nn.Module):
         assert len(flame_params["betas"].shape) == 2
         render_h, render_w = 512, 512
         query_points = None
+        image_feats = image_feats.squeeze(0)
+        latent_points = latent_points.squeeze(0)
 
         if self.latent_query_points_type.startswith("e2e_flame"):
             query_points, flame_params = self.renderer.get_query_points(flame_params,
                                                                         device=image.device)
 
         additional_features = {}
-        with torch.no_grad():                                                
-            latent_points, image_feats = self.forward_latent_points(image[:, 0], camera=None, query_points=query_points, additional_features=additional_features)  # [B, N, C]
-
+        # with torch.no_grad():                                              
+        #     latent_points, image_feats = self.forward_latent_points(image[:, 0], camera=None, query_points=query_points, additional_features=additional_features)  # [B, N, C]
+        
         additional_features.update({
             "image_feats": image_feats, "image": image[:, 0], 
         })
