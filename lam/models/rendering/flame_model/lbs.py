@@ -20,6 +20,7 @@ from __future__ import division
 
 import torch
 import torch.nn.functional as F
+from torch.autograd.profiler import record_function
 
 
 def batch_rodrigues(rot_vecs, epsilon=1e-8, dtype=torch.float32):
@@ -103,6 +104,7 @@ def lbs(
     v_shaped,
     posedirs,
     J_regressor,
+    parents_list_cpu,
     parents,
     lbs_weights,
     pose2rot=True,
@@ -175,7 +177,7 @@ def lbs(
     v_posed = pose_offsets + v_shaped
 
     # 4. Get the global joint location
-    J_transformed, A = batch_rigid_transform(rot_mats, J, parents, dtype=dtype)
+    J_transformed, A = batch_rigid_transform(rot_mats, J, parents_list_cpu, parents, dtype=dtype)
 
     # 5. Do skinning:
     # W is N x V x (J + 1)
@@ -251,7 +253,7 @@ def transform_mat(R, t):
     return torch.cat([F.pad(R, [0, 0, 0, 1]), F.pad(t, [0, 0, 0, 1], value=1)], dim=2)
 
 
-def batch_rigid_transform(rot_mats, joints, parents, dtype=torch.float32):
+def batch_rigid_transform(rot_mats, joints, parents_list_cpu, parents, dtype=torch.float32):
     """
     Applies a batch of rigid transformations to the joints
 
@@ -274,31 +276,27 @@ def batch_rigid_transform(rot_mats, joints, parents, dtype=torch.float32):
         The relative (with respect to the root joint) rigid transformations
         for all the joints
     """
-
+    # with record_function("brt_setup"):
     joints = torch.unsqueeze(joints, dim=-1)
-
     rel_joints = joints.clone().contiguous()
     rel_joints[:, 1:] = rel_joints[:, 1:] - joints[:, parents[1:]]
 
+    # with record_function("brt_transform_mat"):
     transforms_mat = transform_mat(rot_mats.view(-1, 3, 3), rel_joints.view(-1, 3, 1))
     transforms_mat = transforms_mat.view(-1, joints.shape[1], 4, 4)
 
+    # with record_function("brt_chain_loop"):
     transform_chain = [transforms_mat[:, 0]]
     for i in range(1, parents.shape[0]):
-        # Subtract the joint location at the rest pose
-        # No need for rotation, since it's identity when at rest
-        curr_res = torch.matmul(transform_chain[parents[i]], transforms_mat[:, i])
+        parent_idx = parents_list_cpu[i]
+        curr_res = torch.matmul(transform_chain[parent_idx], transforms_mat[:, i])
         transform_chain.append(curr_res)
-
     transforms = torch.stack(transform_chain, dim=1)
 
-    # The last column of the transformations contains the posed joints
+    # with record_function("brt_final_calcs"):
     posed_joints = transforms[:, :, :3, 3]
-
     joints_homogen = F.pad(joints, [0, 0, 0, 1])
-
     rel_transforms = transforms - F.pad(
         torch.matmul(transforms, joints_homogen), [3, 0, 0, 0, 0, 0, 0, 0]
     )
-
     return posed_joints, rel_transforms

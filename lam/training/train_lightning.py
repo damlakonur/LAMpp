@@ -10,14 +10,42 @@ from omegaconf import OmegaConf, DictConfig
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.profilers import PyTorchProfiler
+from torch.profiler import schedule, tensorboard_trace_handler
+_KINETO_AVAILABLE = torch.profiler.kineto_available()
+
+
+if _KINETO_AVAILABLE:
+    def _delete_profilers_fixed(self):
+        # Only attempt to fetch events if profiler is present and alive
+        if self.profiler is not None:
+            if not self._emit_nvtx:
+                # Grab events BEFORE __exit__ destroys the profiler
+                try:
+                    if hasattr(self.profiler, "events"):
+                        self.function_events = self.profiler.events()
+                    elif hasattr(self.profiler, "function_events"):
+                        self.function_events = self.profiler.function_events
+                except AssertionError:
+                    # Profiler object was already destroyed or not initialized: just skip
+                    self.function_events = None
+            self.profiler.__exit__(None, None, None)
+            self.profiler = None
+        if self._schedule is not None:
+            self._schedule.reset()
+        if self._parent_profiler is not None:
+            self._parent_profiler.__exit__(None, None, None)
+            self._parent_profiler = None
+        if self._register is not None:
+            self._register.__exit__(None, None, None)
+            self._register = None
+    PyTorchProfiler._delete_profilers = _delete_profilers_fixed
 
 project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
 from lam.dataset.cafca_lam_dataset import CafcaLamDataset
-# Ensure this import points to your LightningModule file and the correct get_logger
-# If get_logger in lightning_lam_cafca.py is the one from train_lam_cafca.py, that's fine.
 from lam.training.lightning_lam_cafca import LamLightningModel 
 
 # Local get_logger definition for this script
@@ -108,18 +136,26 @@ def train(cfg: DictConfig):
         every_n_epochs=cfg.training.save_every_n_epochs
     )
     callbacks.append(checkpoint_callback)
-
+    if cfg.profiler.get("is_enabled", True):
+        trace_dir = Path("lightning_logs") / "trace_demo"
+        profiler = PyTorchProfiler(
+            schedule=schedule(wait=1, warmup=1, active=1, repeat=0),
+            on_trace_ready=tensorboard_trace_handler(trace_dir),
+            metric="self_cuda_time_total",
+        )
     # Trainer
     logger.info("Starting training...")
     trainer = pl.Trainer(
         logger=wandb_logger,
         callbacks=callbacks,
-        max_epochs=cfg.training.num_epochs,
+        max_epochs=cfg.training.get("num_epochs", 100),
         accelerator=cfg.training.device, 
         devices=1,
-        precision=cfg.training.get("precision", "32-true"), 
-        log_every_n_steps=cfg.wandb.log_every_n_steps,
+        precision=cfg.training.get("precision", "16-mixed"), 
+        log_every_n_steps=1,
         check_val_every_n_epoch=cfg.training.get("validate_every_n_epochs", 1.0),
+        profiler= profiler if cfg.profiler.get("is_enabled") else None,
+        limit_train_batches=3,
     )
 
     trainer.fit(model=lightning_model, 
@@ -133,7 +169,6 @@ if __name__ == "__main__":
         
     cfg = OmegaConf.load(config_path_str)
     
-    # Allow overriding config values from the command line
     cli_overrides = OmegaConf.from_cli(sys.argv[2:])
     cfg = OmegaConf.merge(cfg, cli_overrides)
     

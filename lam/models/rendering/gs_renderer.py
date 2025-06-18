@@ -70,16 +70,15 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
 
-def getProjectionMatrix(znear, zfar, fovX, fovY):
-    tanHalfFovY = math.tan((fovY / 2))
-    tanHalfFovX = math.tan((fovX / 2))
+def getProjectionMatrix(znear, zfar, fovX, fovY, device):
+    tanHalfFovY = torch.tan((fovY / 2))
+    tanHalfFovX = torch.tan((fovX / 2))
 
     top = tanHalfFovY * znear
     bottom = -top
     right = tanHalfFovX * znear
     left = -right
-
-    P = torch.zeros(4, 4)
+    P = torch.zeros(4, 4, device=device)
 
     z_sign = 1.0
 
@@ -114,7 +113,7 @@ class Camera:
         self.trans = trans
         self.scale = scale
 
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).to(w2c.device)
+        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy, device=w2c.device).transpose(0,1)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
@@ -597,6 +596,7 @@ class GS3DRenderer(nn.Module):
             else:
                 expr = flame_data["expr"]
             # Bottleneck: FLAME forward
+            # with torch.autograd.profiler.record_function("flame_animation_forward"):
             ret = self.flame_model.animation_forward(v_cano=mean_3d,
                                                 shape=flame_data["betas"].repeat(num_view, 1),
                                                 expr=expr,
@@ -686,7 +686,7 @@ class GS3DRenderer(nn.Module):
             out_list.append(self.forward_single_view(
                                 gs_list[v_idx], 
                                 Camera.from_c2w(c2w, intrinsic, height, width),
-                                background_color[v_idx], 
+                                background_color[v_idx] if background_color is not None else torch.tensor([0.,0.,0.], device=self.device),
                             ))
         
         out = defaultdict(list)
@@ -772,6 +772,7 @@ class GS3DRenderer(nn.Module):
         for b in range(batch_size):
             gs_model = gs_model_list[b]
             query_pt = query_points[b]
+            # with torch.autograd.profiler.record_function("animate_gs_model"):
             animatable_gs_model_list: list[GaussianModel] = self.animate_gs_model(gs_model,
                                                                                   query_pt,
                                                                                   self.get_sing_batch_smpl_data(flame_data, b),
@@ -848,9 +849,10 @@ class GS3DRenderer(nn.Module):
         **kwargs):
         
         # need shape_params of flame_data to get querty points and get "transform_mat_neutral_pose"
+        # with torch.autograd.profiler.record_function("forward_gs"):
         gs_model_list, query_points, flame_data, query_gs_features = self.forward_gs(gs_hidden_features, query_points, flame_data=flame_data,
                                                                       additional_features=additional_features, debug=debug)
-        
+        # with torch.autograd.profiler.record_function("forward_animate_gs"):
         out = self.forward_animate_gs(gs_model_list, query_points, flame_data, c2w, intrinsic, height, width, background_color, debug)
         
         return out

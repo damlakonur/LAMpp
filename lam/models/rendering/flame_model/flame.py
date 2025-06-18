@@ -29,6 +29,7 @@ import numpy as np
 from tqdm import tqdm
 import pickle
 from collections import defaultdict
+from torch.autograd.profiler import record_function
 try:
     from pytorch3d.io import load_obj
 except ImportError:
@@ -148,6 +149,7 @@ class FlameHead(nn.Module):
         parents = to_tensor(to_np(flame_model.kintree_table[0])).long()
         parents[0] = -1
         self.register_buffer("parents", parents)
+        self.parents_list_cpu = parents.cpu().tolist()
         self.register_buffer(
             "lbs_weights", to_tensor(to_np(flame_model.weights), dtype=self.dtype)
         )
@@ -843,6 +845,7 @@ class FlameHeadSubdivided(FlameHead):
             template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
         
         # Add shape contribution
+        # with record_function("blend_shapes_step1"):
         v_shaped = template_vertices + blend_shapes(betas, self.shapedirs)
 
         # Add personal offsets
@@ -852,14 +855,16 @@ class FlameHeadSubdivided(FlameHead):
             else:
                 v_shaped += static_offset
 
-        A, J = self.get_transformed_mat(pose=full_pose, v_shaped=v_shaped, posedirs=self.posedirs,
+        A, J = self.get_transformed_mat(pose=full_pose, v_shaped=v_shaped, posedirs=self.posedirs, parents_list_cpu=self.parents_list_cpu,
                                         parents=self.parents, J_regressor=self.J_regressor, pose2rot=True, 
                                         dtype=self.dtype)
 
         # step2. v_cano_with_expr
+        # with record_function("blend_shapes_expr_step2"):
         v_cano_with_expr = v_cano + blend_shapes(expr, self.shapedirs_up[:, :, self.n_shape_params:])
         
         # step3. lbs
+        # with record_function("skinning_step3"):
         vertices = self.skinning(v_posed=v_cano_with_expr, A=A, lbs_weights=self.lbs_weights_up, batch_size=batch_size,
                                  num_joints=self.joint_num, dtype=self.dtype, device=full_pose.device)
         
@@ -894,16 +899,15 @@ class FlameHeadSubdivided(FlameHead):
         
         return ret_vals
     
-    def get_transformed_mat(self, pose, v_shaped, posedirs, parents, J_regressor, pose2rot, dtype):
+    def get_transformed_mat(self, pose, v_shaped, posedirs, parents_list_cpu, parents, J_regressor, pose2rot, dtype):
+        # with record_function("get_transformed_mat_entry"):
         batch_size = pose.shape[0]
         device = pose.device
 
-        # Get the joints
-        # NxJx3 array
+        # with record_function("get_transformed_mat_vertices2joints"):
         J = vertices2joints(J_regressor, v_shaped)
 
-        # 3. Add pose blend shapes
-        # N x J x 3 x 3
+        # with record_function("get_transformed_mat_pose_blendshapes"):
         ident = torch.eye(3, dtype=dtype, device=device)
         if pose2rot:
             rot_mats = batch_rodrigues(pose.view(-1, 3), dtype=dtype).view(
@@ -923,8 +927,8 @@ class FlameHeadSubdivided(FlameHead):
 
         v_posed = pose_offsets + v_shaped
 
-        # 4. Get the global joint location
-        J_transformed, A = batch_rigid_transform(rot_mats, J, parents, dtype=dtype)
+        # with record_function("get_transformed_mat_batch_rigid_transform"):
+        J_transformed, A = batch_rigid_transform(rot_mats, J, parents_list_cpu, parents, dtype=dtype)
         
         return A, J_transformed
     

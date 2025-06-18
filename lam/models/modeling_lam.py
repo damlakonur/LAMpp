@@ -208,6 +208,7 @@ class ModelLAM(nn.Module):
         #     f"Feature dimension mismatch: {camera_embeddings.shape[-1]} vs {self.camera_embed_dim}"
 
         # transformer generating latent points
+        # TODO first save directly the tokens then load it, check with profiler or look at it/s
         tokens = self.forward_transformer(image_feats, camera_embeddings=None, query_points=query_points, query_feats=query_feats)
 
         return tokens, image_feats
@@ -249,6 +250,7 @@ class ModelLAM(nn.Module):
         additional_features["image_feats_bchw"] = image_feats_bchw
 
         # render target views
+        # with torch.autograd.profiler.record_function("renderer"):
         render_results = self.renderer(gs_hidden_features=latent_points,
                                        query_points=query_points,
                                        flame_data=flame_params,

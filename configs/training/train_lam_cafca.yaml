@@ -53,16 +53,16 @@ dataset:
   cafca_subject_ids_train: [30, 31, 32, 33, 34, 35, 36, 37, 41, 45]
   cafca_subject_ids_val: [48, 49, 50, 51, 55]
   num_of_src_views: 1
-  num_of_target_views: 4
+  num_of_target_views: 4 # try 2-3 and increase batch size
 
 training:
   batch_size: 1
-  num_epochs: 200
-  learning_rate: 1.0e-4
+  num_epochs: 3
+  learning_rate: 1e-5
   device: "cuda"
   save_every_n_epochs: 1
   image_size: 512
-  num_workers: 2
+  num_workers: 4
   l1_loss_weight: 1.0
   finetune_renderer_mlp_only: True
   validate_every_n_epochs: 10
@@ -70,9 +70,13 @@ training:
   num_train_samples_to_log: 1
 
 wandb:
-  enabled: True
+  enabled: false
   project: "lam-1-view-finetuning"
   entity: "gr-lampp"
   run_name: "lam_cafca_finetune_renderer_mlp_test"
   log_every_n_steps: 10
   log_train_images_every_n_steps: 10
+
+profiler:
+  is_enabled: true
+  log_dir: "./lightning_logs"
