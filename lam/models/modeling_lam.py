@@ -61,6 +61,8 @@ class ModelLAM(nn.Module):
                  fix_opacity=False,
                  fix_rotation=False,
                  flame_scale=1.0,
+                 instantiate_encoder=True,
+                 instantiate_transformer=True,
                  **kwargs,
                  ):
         super().__init__()
@@ -71,14 +73,19 @@ class ModelLAM(nn.Module):
         self.encoder_feat_dim = encoder_feat_dim
         self.conf_use_pred_img = False
         self.conf_cat_feat = False and self.conf_use_pred_img  # True # False
+        self.instantiate_encoder = instantiate_encoder
+        self.instantiate_transformer = instantiate_transformer
 
         # modules
         # image encoder
-        self.encoder = self._encoder_fn(encoder_type)(
-            model_name=encoder_model_name,
-            freeze=encoder_freeze,
-            encoder_feat_dim=encoder_feat_dim,
-        )
+        if instantiate_encoder:
+            self.encoder = self._encoder_fn(encoder_type)(
+                model_name=encoder_model_name,
+                freeze=encoder_freeze,
+                encoder_feat_dim=encoder_feat_dim,
+            )
+        else:
+            self.encoder = None
 
         # learnable points embedding
         skip_decoder = False
@@ -99,12 +106,15 @@ class ModelLAM(nn.Module):
             raise NotImplementedError
         print("==="*16*3, f"\nskip_decoder: {skip_decoder}", "\n"+"==="*16*3)
         # transformer
-        self.transformer = TransformerDecoder(
-            block_type=transformer_type,
-            num_layers=transformer_layers, num_heads=transformer_heads,
-            inner_dim=transformer_dim, cond_dim=encoder_feat_dim, mod_dim=None,
-            gradient_checkpointing=self.gradient_checkpointing,
-        )
+        if instantiate_transformer:
+            self.transformer = TransformerDecoder(
+                block_type=transformer_type,
+                num_layers=transformer_layers, num_heads=transformer_heads,
+                inner_dim=transformer_dim, cond_dim=encoder_feat_dim, mod_dim=None,
+                gradient_checkpointing=self.gradient_checkpointing,
+            )
+        else:
+            self.transformer = None
         
         # renderer
         self.renderer = GS3DRenderer(human_model_path=human_model_path,
@@ -202,10 +212,6 @@ class ModelLAM(nn.Module):
             query_feats = proj_feats['source_image_feats']
         else:
             query_feats = None
-        # # embed camera
-        # camera_embeddings = self.camera_embedder(camera)
-        # assert camera_embeddings.shape[-1] == self.camera_embed_dim, \
-        #     f"Feature dimension mismatch: {camera_embeddings.shape[-1]} vs {self.camera_embed_dim}"
 
         # transformer generating latent points
         # TODO first save directly the tokens then load it, check with profiler or look at it/s

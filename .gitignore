@@ -17,3 +17,4 @@ tracking_results/
 *.txt
 *.png
 wandb/*
+lightning_logs/*
