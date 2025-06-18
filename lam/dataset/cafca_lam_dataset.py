@@ -322,7 +322,9 @@ class CafcaLamDataset(Dataset):
             "driving_masks": torch.stack(driving_mask_list),
             "source_bg_colors": torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).repeat(len(source_images_list), 1),
             "render_bg_colors": torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).repeat(len(driving_images_list), 1),
-            "uid": f"subj{subject_id}_src{''.join(source_cam_ids_list)}_drv{''.join(driving_cam_ids_list)}"
+            "uid": f"subj{subject_id}_src{''.join(source_cam_ids_list)}_drv{''.join(driving_cam_ids_list)}",
+            "subject_id_int_scalar": subject_id, # Added for easier access to subject ID
+            "source_cam_ids_list_scalar": source_cam_ids_list, # Added for easier access to source cam IDs
         }
 
         out_item['betas'] = subject_flame_params['betas']
