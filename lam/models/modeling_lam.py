@@ -193,7 +193,7 @@ class ModelLAM(nn.Module):
             image_feats = self.encoder(image)
         return image_feats
 
-    @torch.compile
+    # @torch.compile
     def forward_latent_points(self, image, camera, query_points=None, additional_features=None):
         # image: [B, C_img, H_img, W_img]
         # camera: [B, D_cam_raw]
@@ -219,46 +219,16 @@ class ModelLAM(nn.Module):
 
         return tokens, image_feats
 
-    def forward(self, image, source_c2ws, source_intrs, render_c2ws, render_intrs, render_bg_colors, flame_params, latent_points, image_feats, source_flame_params=None, render_images=None, data=None):
-        # image: [B, N_ref, C_img, H_img, W_img]
-        # source_c2ws: [B, N_ref, 4, 4]
-        # source_intrs: [B, N_ref, 4, 4]
-        # render_c2ws: [B, N_source, 4, 4]
-        # render_intrs: [B, N_source, 4, 4]
-        # render_bg_colors: [B, N_source, 3]
-        # flame_params: Dict, e.g., pose_shape: [B, N_source, 21, 3], betas:[B, 100]
-        # print("image shape:", image.shape)  # Expected: [B, N_ref, C, H, W]
-        # print("render_c2ws shape:", render_c2ws.shape)  # Expected: [B, N_render, 4, 4]
-        # print("render_bg_colors shape:", render_bg_colors.shape)  # Expected: [B, N_render, 3]
-        # print("flame_params['betas'] shape:", flame_params["betas"].shape)  # Expected: [B, N_betas]
-        # print("flame_params['expr'] shape:", flame_params["expr"].shape)    # Expected: [B, N_expr]
-        # breakpoint()
-        assert image.shape[0] == render_c2ws.shape[0], "Batch size mismatch for image and render_c2ws"
-        assert image.shape[0] == render_bg_colors.shape[0], "Batch size mismatch for image and render_bg_colors"
-        assert image.shape[0] == flame_params["betas"].shape[0], "Batch size mismatch for image and flame_params"
-        assert image.shape[0] == flame_params["expr"].shape[0], "Batch size mismatch for image and flame_params"
+    def forward(self, render_c2ws, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
         assert len(flame_params["betas"].shape) == 2
         render_h, render_w = 512, 512
         query_points = None
-        image_feats = image_feats.squeeze(0)
-        latent_points = latent_points.squeeze(0)
+        # image_feats = image_feats.squeeze(1)
+        latent_points = latent_points.squeeze(1)
 
         if self.latent_query_points_type.startswith("e2e_flame"):
             query_points, flame_params = self.renderer.get_query_points(flame_params,
-                                                                        device=image.device)
-
-        additional_features = {}
-        # with torch.no_grad():                                              
-        #     latent_points, image_feats = self.forward_latent_points(image[:, 0], camera=None, query_points=query_points, additional_features=additional_features)  # [B, N, C]
-        
-        additional_features.update({
-            "image_feats": image_feats, "image": image[:, 0], 
-        })
-        image_feats_bchw = rearrange(image_feats, "b (h w) c -> b c h w", h=int(math.sqrt(image_feats.shape[1])))
-        additional_features["image_feats_bchw"] = image_feats_bchw
-
-        # render target views
-        # with torch.autograd.profiler.record_function("renderer"):
+                                                                        device=render_c2ws.device)
         render_results = self.renderer(gs_hidden_features=latent_points,
                                        query_points=query_points,
                                        flame_data=flame_params,
@@ -267,7 +237,7 @@ class ModelLAM(nn.Module):
                                        height=render_h,
                                        width=render_w,
                                        background_color=render_bg_colors,
-                                       additional_features=additional_features
+                                       additional_features=None
         )
 
         N, M = render_c2ws.shape[:2]

@@ -2,7 +2,7 @@ import os
 import sys
 import logging
 from pathlib import Path
-import datetime
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -13,6 +13,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.profilers import PyTorchProfiler
 from torch.profiler import schedule, tensorboard_trace_handler
 _KINETO_AVAILABLE = torch.profiler.kineto_available()
+import torch.utils.benchmark as benchmark
 
 
 if _KINETO_AVAILABLE:
@@ -94,7 +95,9 @@ def train(cfg: DictConfig):
         batch_size=cfg.training.batch_size,
         shuffle=True,
         num_workers=cfg.training.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=3
     )
     logger.info(f"Train dataset size: {len(train_dataset)}. Train Dataloader size: {len(train_dataloader)} batches.")
 
@@ -112,7 +115,6 @@ def train(cfg: DictConfig):
             batch_size=cfg.training.batch_size,
             shuffle=False,
             num_workers=cfg.training.num_workers,
-            pin_memory=True
         )
         logger.info(f"Validation dataset size: {len(val_dataset)}. Val Dataloader size: {len(val_dataloader)} batches.")
 
@@ -137,7 +139,7 @@ def train(cfg: DictConfig):
     )
     callbacks.append(checkpoint_callback)
     if cfg.profiler.get("is_enabled", True):
-        trace_dir = Path("lightning_logs") / "trace_demo"
+        trace_dir = Path("lightning_logs") / "demo_npz"
         profiler = PyTorchProfiler(
             schedule=schedule(wait=1, warmup=1, active=1, repeat=0),
             on_trace_ready=tensorboard_trace_handler(trace_dir),
@@ -150,12 +152,10 @@ def train(cfg: DictConfig):
         callbacks=callbacks,
         max_epochs=cfg.training.get("num_epochs", 100),
         accelerator=cfg.training.device, 
-        devices=1,
         precision=cfg.training.get("precision", "16-mixed"), 
-        log_every_n_steps=1,
+        log_every_n_steps=cfg.wandb.log_every_n_steps,
         check_val_every_n_epoch=cfg.training.get("validate_every_n_epochs", 1.0),
         profiler= profiler if cfg.profiler.get("is_enabled") else None,
-        limit_train_batches=3,
     )
 
     trainer.fit(model=lightning_model, 
@@ -164,7 +164,8 @@ def train(cfg: DictConfig):
 
     logger.info("Training finished.")
 
-if __name__ == "__main__":    
+if __name__ == "__main__":
+
     config_path_str = sys.argv[1] if len(sys.argv) > 1 else "configs/training/train_lam_cafca.yaml"
         
     cfg = OmegaConf.load(config_path_str)
@@ -174,5 +175,48 @@ if __name__ == "__main__":
     
     logger.info("Configuration loaded:")
     logger.info(OmegaConf.to_yaml(cfg))
-
     train(cfg)
+
+    # train_dataset = CafcaLamDataset(
+    #     subject_list=list(cfg.dataset.cafca_subject_ids_train),
+    #     num_source_frames=cfg.dataset.num_of_src_views,
+    #     num_driving_frames=cfg.dataset.num_of_target_views,
+    #     image_size=cfg.training.image_size,
+    #     is_val=False
+    # )
+    # train_dataloader = DataLoader(
+    #     train_dataset,
+    #     batch_size=cfg.training.batch_size,
+    #     shuffle=True,
+    #     num_workers=cfg.training.num_workers,
+    #     pin_memory=True,
+    #     persistent_workers=True,
+    #     prefetch_factor=3
+    # )
+    # logger.info(f"Train dataset size: {len(train_dataset)}. Train Dataloader size: {len(train_dataloader)} batches.")
+    # timer_load = benchmark.Timer(
+    #     stmt="next(loader_iter)",
+    #     setup="loader_iter = iter(train_dataloader)",
+    #     globals={"train_dataloader": train_dataloader},
+    #     num_threads=1,
+    # )
+
+    # timer_prep = benchmark.Timer(
+    #     stmt="""\
+    # batch_gpu = prepare_batch_for_model(batch_cpu, device)
+    # torch.cuda.synchronize()
+    # """,
+    #     setup="""\
+    # from __main__ import prepare_batch_for_model
+    # device = torch.device('cuda')
+    # loader_iter = iter(train_dataloader)
+    # batch_cpu = next(loader_iter)
+    # """,
+    #     globals={"train_dataloader": train_dataloader},
+    #     num_threads=1,
+    # )
+
+    # print("DataLoader only :", timer_load.timeit(20))
+    # print("Prepare only    :", timer_prep.timeit(20))
+
+    # print(t.timeit(10))

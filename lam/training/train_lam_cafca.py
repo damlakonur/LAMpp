@@ -39,54 +39,79 @@ def get_logger(name, level=logging.INFO):
 logger = get_logger(__name__)
 
 
-def prepare_batch_for_model(batch_from_dataloader, device):
+def prepare_batch_for_model(batch, device):
     """
     Prepares a batch of data from CafcaLamDataset (already batched by DataLoader)
     for input to ModelLAM. Moves tensors to device and structures them as expected by the model.
     Casts image-related tensors to float32 to avoid dtype issues in torch.compile.
     """
+    def _move(x, dtype=None):
+        """Pinned-memory -> GPU async copy; optional fused cast."""
+        if torch.is_tensor(x):
+            return x.to(device=device, dtype=dtype or x.dtype, non_blocking=True)
+        return x
+    prepared = {
+        "image": _move(batch["source_rgbs"]),
+        "latent_points": _move(batch["tokens"]),
+    }
+    
+    prepared["render_c2ws"]   = _move(batch["driving_c2ws"])
+    prepared["render_intrs"]  = _move(batch["driving_intrs"])
+    prepared["render_bg_colors"] = _move(batch["render_bg_colors"])
 
-    prepared_batch = {}
+    if "driving_masks" in batch:
+        prepared["driving_masks"] = _move(batch["driving_masks"])
 
-    # Source data for encoding
-    prepared_batch["image"] = batch_from_dataloader["source_rgbs"].to(device).float()  # [B, N_ref, 3, H, W]
-    prepared_batch["source_c2ws"] = batch_from_dataloader["source_c2ws"].to(device).float()  # [B, N_ref, 4, 4]
-    prepared_batch["source_intrs"] = batch_from_dataloader["source_intrs"].to(device).float()  # [B, N_ref, 4, 4]
-    if "source_masks" in batch_from_dataloader:
-        prepared_batch["source_masks"] = batch_from_dataloader["source_masks"].to(device).float()
-    prepared_batch["image_feats"] = batch_from_dataloader["img_feats"].to(device).float()
-    prepared_batch["latent_points"] = batch_from_dataloader["tokens"].to(device).float()
+    prepared["gt_render_images"] = _move(batch["driving_image"])
+    flame = {}
+    betas = batch["betas"]
+    if betas.ndim == 3:
+        betas = betas[:, 0]
+    flame["betas"] = _move(betas, torch.float32)
 
-    # Target/Driving data for rendering
-    prepared_batch["render_c2ws"] = batch_from_dataloader["driving_c2ws"].to(device).float()  # [B, N_render, 4, 4]
-    prepared_batch["render_intrs"] = batch_from_dataloader["driving_intrs"].to(device).float()  # [B, N_render, 4, 4]
-    prepared_batch["render_bg_colors"] = batch_from_dataloader["render_bg_colors"].to(device).float()  # [B, N_render, 3]
-    if "driving_masks" in batch_from_dataloader:
-        prepared_batch["driving_masks"] = batch_from_dataloader["driving_masks"].to(device).float()
+    for k in ["expr", "rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation"]:
+        if k in batch:
+            flame[k] = _move(batch[k], torch.float32)
 
-    # Ground truth for loss
-    prepared_batch["gt_render_images"] = batch_from_dataloader["driving_image"].to(device).float()  # [B, N_render, 3, H, W]
+    prepared["flame_params"] = flame
+    if "uid" in batch:
+        prepared["uid"] = batch["uid"] 
 
-    # FLAME parameters
-    flame_params_for_model = {}
-    flame_keys_base = ["expr", "rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation"]
+    # # Source data for encoding
+    # prepared_batch["image"] = batch_from_dataloader["source_rgbs"].to(device).float()  # [B, N_ref, 3, H, W]
 
-    betas = batch_from_dataloader["betas"]
-    if betas.ndim == 3:  # [B, N_render, D]
-        betas = betas[:, 0, :]
-    flame_params_for_model["betas"] = betas.to(device).float()  # [B, D]
+    # prepared_batch["latent_points"] = batch_from_dataloader["tokens"].to(device)
 
-    for key in flame_keys_base:
-        if key in batch_from_dataloader:
-            flame_params_for_model[key] = batch_from_dataloader[key].to(device).float()
+    # # Target/Driving data for rendering
+    # prepared_batch["render_c2ws"] = batch_from_dataloader["driving_c2ws"].to(device).float()  # [B, N_render, 4, 4]
+    # prepared_batch["render_intrs"] = batch_from_dataloader["driving_intrs"].to(device).float()  # [B, N_render, 4, 4]
+    # prepared_batch["render_bg_colors"] = batch_from_dataloader["render_bg_colors"].to(device).float()  # [B, N_render, 3]
+    # if "driving_masks" in batch_from_dataloader:
+    #     prepared_batch["driving_masks"] = batch_from_dataloader["driving_masks"].to(device).float()
 
-    prepared_batch["flame_params"] = flame_params_for_model
+    # # Ground truth for loss
+    # prepared_batch["gt_render_images"] = batch_from_dataloader["driving_image"].to(device).float()  # [B, N_render, 3, H, W]
 
-    # Optional UID
-    if "uid" in batch_from_dataloader:
-        prepared_batch["uid"] = batch_from_dataloader["uid"]
+    # # FLAME parameters
+    # flame_params_for_model = {}
+    # flame_keys_base = ["expr", "rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation"]
 
-    return prepared_batch
+    # betas = batch_from_dataloader["betas"]
+    # if betas.ndim == 3:  # [B, N_render, D]
+    #     betas = betas[:, 0, :]
+    # flame_params_for_model["betas"] = betas.to(device).float()  # [B, D]
+
+    # for key in flame_keys_base:
+    #     if key in batch_from_dataloader:
+    #         flame_params_for_model[key] = batch_from_dataloader[key].to(device).float()
+
+    # prepared_batch["flame_params"] = flame_params_for_model
+
+    # # Optional UID
+    # if "uid" in batch_from_dataloader:
+    #     prepared_batch["uid"] = batch_from_dataloader["uid"]
+
+    return prepared
 
 def _build_model(cfg):
     """

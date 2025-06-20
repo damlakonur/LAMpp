@@ -11,7 +11,6 @@ import torch.nn.functional as F
 import wandb
 from safetensors.torch import load_file
 import torch
-from time import time
 
 project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
@@ -35,6 +34,9 @@ class LamLightningModel(pl.LightningModule):
         # self.lpips_loss_fn = LPIPSLoss()
 
         self.time_metrics = {}
+        
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        return prepare_batch_for_model(batch, device)
 
     def _build_model(self, cfg: DictConfig):
         model = ModelLAM(**cfg.model)
@@ -74,76 +76,62 @@ class LamLightningModel(pl.LightningModule):
         return model
 
     def forward(self, batch):
-        model_input_data = prepare_batch_for_model(batch, self.device)
+        # model_input_data = prepare_batch_for_model(batch, self.device)
         return self.model(
-            image=model_input_data["image"],
-            source_c2ws=model_input_data["source_c2ws"],
-            source_intrs=model_input_data["source_intrs"],
-            render_c2ws=model_input_data["render_c2ws"],
-            render_intrs=model_input_data["render_intrs"],
-            flame_params=model_input_data["flame_params"],
-            render_bg_colors=model_input_data["render_bg_colors"]
+            image=batch["image"],
+            source_c2ws=batch["source_c2ws"],
+            source_intrs=batch["source_intrs"],
+            render_c2ws=batch["render_c2ws"],
+            render_intrs=batch["render_intrs"],
+            flame_params=batch["flame_params"],
+            render_bg_colors=batch["render_bg_colors"]
         )
 
     def training_step(self, batch, batch_idx):
-        start_time = time()
-        
-        model_input_data = prepare_batch_for_model(batch, self.device)
-        self.time_metrics['prepare_batch_time'] = time() - start_time
-        
-        start_time = time()
+        # model_input_data = prepare_batch_for_model(batch, self.device)
 
         model_output = self.model(
-            image=model_input_data["image"],
-            source_c2ws=model_input_data["source_c2ws"],
-            source_intrs=model_input_data["source_intrs"],
-            render_c2ws=model_input_data["render_c2ws"],
-            render_intrs=model_input_data["render_intrs"],
-            flame_params=model_input_data["flame_params"],
-            latent_points=model_input_data.get("latent_points"),
-            image_feats=model_input_data.get("image_feats"),
-            render_bg_colors=model_input_data["render_bg_colors"]
+            # image=model_input_data["image"],
+            # source_c2ws=model_input_data["source_c2ws"],
+            # source_intrs=model_input_data["source_intrs"],
+            render_c2ws=batch["render_c2ws"],
+            render_intrs=batch["render_intrs"],
+            flame_params=batch["flame_params"],
+            latent_points=batch.get("latent_points"),
+            # image_feats=model_input_data.get("image_feats"),
+            render_bg_colors=batch["render_bg_colors"]
         )
-        self.time_metrics['model_forward_time'] = time() - start_time
-        start_time = time()
         pred_rgb = model_output['comp_rgb']
-        gt_rgb = model_input_data['gt_render_images']
+        gt_rgb = batch['gt_render_images']
 
         loss_l1 = self.l1_loss_fn(pred_rgb, gt_rgb)
         total_loss = self.cfg.training.l1_loss_weight * loss_l1
-        self.time_metrics['loss_calculation_time'] = time() - start_time
-        
-        self.log_dict({
-            'train/prepare_batch_time': self.time_metrics['prepare_batch_time'],
-            'train/model_forward_time': self.time_metrics['model_forward_time'],
-            'train/loss_calculation_time': self.time_metrics['loss_calculation_time']
-        }, on_step=True, on_epoch=True)
 
         self.log('train/total_loss', total_loss, prog_bar=True, on_step=True, on_epoch=True)
         self.log('train/l1_loss', loss_l1, on_step=True, on_epoch=True)
         self.log('learning_rate', self.optimizers().param_groups[0]['lr'], on_step=True, on_epoch=False)
 
         if self.global_step % self.cfg.wandb.log_train_images_every_n_steps == 0 and self.logger is not None:
-            self._log_image_samples(model_input_data, pred_rgb, gt_rgb, "train")
+            self._log_image_samples(batch, pred_rgb, gt_rgb, "train")
 
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        model_input_data = prepare_batch_for_model(batch, self.device)
+        # model_input_data = prepare_batch_for_model(batch, self.device)
 
         model_output = self.model(
-            image=model_input_data["image"],
-            source_c2ws=model_input_data["source_c2ws"],
-            source_intrs=model_input_data["source_intrs"],
-            render_c2ws=model_input_data["render_c2ws"],
-            render_intrs=model_input_data["render_intrs"],
-            flame_params=model_input_data["flame_params"],
-            latent_points=model_input_data.get("latent_points"),
-            image_feats=model_input_data.get("image_feats"),
-            render_bg_colors=model_input_data["render_bg_colors"]
+            # image=model_input_data["image"],
+            # source_c2ws=model_input_data["source_c2ws"],
+            # source_intrs=model_input_data["source_intrs"],
+            render_c2ws=batch["render_c2ws"],
+            render_intrs=batch["render_intrs"],
+            flame_params=batch["flame_params"],
+            latent_points=batch.get("latent_points"),
+            # image_feats=model_input_data.get("image_feats"),
+            render_bg_colors=batch["render_bg_colors"]
         )
         pred_rgb = model_output['comp_rgb']
-        gt_rgb = model_input_data['gt_render_images']
+        gt_rgb = batch['gt_render_images']
 
         loss_l1 = self.l1_loss_fn(pred_rgb, gt_rgb)
         total_loss = self.cfg.training.l1_loss_weight * loss_l1
@@ -151,7 +139,7 @@ class LamLightningModel(pl.LightningModule):
         self.log('val/total_loss', total_loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log('val/l1_loss', loss_l1, on_step=False, on_epoch=True)
 
-        self._log_image_samples(model_input_data, pred_rgb, gt_rgb, "val")
+        self._log_image_samples(batch, pred_rgb, gt_rgb, "val")
 
         return total_loss
 
