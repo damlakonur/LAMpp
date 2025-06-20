@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
-from PIL import Image
+
+import json
 from torch.utils.data import Dataset
 from lam.dataset import env_paths
 import numpy as np
@@ -89,7 +89,13 @@ class CafcaLamDataset(Dataset):
         self.num_source_frames = num_source_frames
         self.image_size = image_size
         self.is_val = is_val
-        
+        source_json_path = self.root_dir / "available_source_views.json"
+        with open(source_json_path, "r") as f:
+            raw = json.load(f)
+        self.allowed_source_cams = {
+            int(entry["subject_id"]): set(entry["cameras_with_non_zero_lmks"])
+            for entry in raw
+        }
 
         for subject_int in subject_list:
             subject_str_zfill = str(subject_int).zfill(5)
@@ -165,38 +171,24 @@ class CafcaLamDataset(Dataset):
                         "cam_2_world_np": np.array(cam_params["cam2world"], dtype=np.float32),
                         "intrinsic_np": np.array(cam_params["K"], dtype=np.float32),
                         "token_file_path": str(token_file),
+                        "is_source_candidate": cam_id in self.allowed_source_cams.get(subject_int, set()),
                     }
                     self.data.append(frame_data)
                 except Exception as e:
                     print(f"Error loading data for subject {subject_str_zfill}, cam {cam_id}: {e}")
 
-        if not self.data:
-            print(f"{self.__class__.__name__} initialized with no data items. Check paths and subject_list.")
-            self.item_list = []
-            return
-
         self.subject_data = {}
         for item in self.data:
-            subject_id = item["subject_id_int"]
-            if subject_id not in self.subject_data:
-                self.subject_data[subject_id] = []
-            self.subject_data[subject_id].append(item)
+            self.subject_data.setdefault(item["subject_id_int"], []).append(item)
 
         self.item_list = []
+        self.source_candidates = {}
         for subject_id, frames in self.subject_data.items():
-            if len(frames) < 1:
-                continue
-            if self.num_driving_frames > 0 and len(frames) < 1:
-                print(f"Subject {subject_id} has {len(frames)} frames, insufficient for driving. Skipping.")
-                continue
-
+            cand_idx = [i for i, fr in enumerate(frames) if fr["is_source_candidate"]]
+            self.source_candidates[subject_id] = cand_idx
             for source_frame_index in range(len(frames)):
                  self.item_list.append((subject_id, source_frame_index))
-
-        if not self.item_list:
-            print(f"{self.__class__.__name__} initialized with no valid items.")
-        else:
-            print(f"Initialized {self.__class__.__name__} with {len(self.item_list)} potential items.")
+        print(f"Initialized {self.__class__.__name__} with {len(self.item_list)} potential items.")
     
     def _load_image_as_tensor(self, path_str):
         img_tensor = read_image(path_str)
@@ -225,59 +217,68 @@ class CafcaLamDataset(Dataset):
         if not (0 <= idx < len(self.item_list)):
             raise IndexError("Index out of bounds")
 
-        subject_id, primary_source_idx_in_subject_list = self.item_list[idx]
+        # ------------------------------------------------------------------
+        # 1. resolve primary source strictly from candidate list
+        # ------------------------------------------------------------------
+        subject_id, initial_idx = self.item_list[idx]
         subject_frames_info = self.subject_data[subject_id]
-
-        subject_flame_params = self._load_subject_flame_params(
-            subject_frames_info[primary_source_idx_in_subject_list]["subject_flame_param_path"])
-
+        candidates = self.source_candidates[subject_id]
+        primary_source_idx_in_subject_list = (
+            initial_idx if initial_idx in candidates
+            else np.random.choice(candidates)
+        )
+        # ------------------------------------------------------------------
+        # 2.  MULTIPLE sources — also restricted to candidates
+        # ------------------------------------------------------------------
         source_frame_indices = [primary_source_idx_in_subject_list]
+
         if self.num_source_frames > 1:
-            additional_sources_needed = self.num_source_frames - 1
-            potential_additional_indices = [i for i in range(len(subject_frames_info)) if i != primary_source_idx_in_subject_list]
-            selected_additional_sources = []
+            additional_needed = self.num_source_frames - 1
+            extra_pool = [i for i in candidates if i != primary_source_idx_in_subject_list]
+
             if self.is_val:
-                selected_additional_sources = potential_additional_indices[:additional_sources_needed]
+                selected = extra_pool[:additional_needed]
             else:
-                if potential_additional_indices:
-                    num_to_sample = min(additional_sources_needed, len(potential_additional_indices))
-                    selected_additional_sources = np.random.choice(
-                        potential_additional_indices,
-                        size=num_to_sample,
-                        replace=False
-                    ).tolist()
-            source_frame_indices.extend(selected_additional_sources)
-            while len(source_frame_indices) < self.num_source_frames and source_frame_indices:
+                num_to_sample = min(additional_needed, len(extra_pool))
+                selected = list(np.random.choice(extra_pool, size=num_to_sample, replace=False)) if extra_pool else []
+
+            source_frame_indices.extend(selected)
+
+            while len(source_frame_indices) < self.num_source_frames:
                 source_frame_indices.append(source_frame_indices[-1])
 
-        if not source_frame_indices and self.num_source_frames > 0 and subject_frames_info:
-            source_frame_indices = [primary_source_idx_in_subject_list]
+        # ------------------------------------------------------------------
+        # 3. driving frames: any non-source frame is eligible
+        # ------------------------------------------------------------------
+        candidate_driving_indices = [i for i in range(len(subject_frames_info))
+                                    if i not in source_frame_indices]
+
+        if self.num_driving_frames > 0:
+            if self.is_val:
+                driving_indices_in_subject_list = (candidate_driving_indices[:self.num_driving_frames]
+                                                or candidate_driving_indices)
+                while len(driving_indices_in_subject_list) < self.num_driving_frames:
+                    driving_indices_in_subject_list.append(driving_indices_in_subject_list[-1])
+            else:
+                driving_indices_in_subject_list = list(np.random.choice(
+                    candidate_driving_indices,
+                    size=self.num_driving_frames,
+                    replace=len(candidate_driving_indices) < self.num_driving_frames
+                ))
+
+        # ------------------------------------------------------------------
+        # 4. load data  (unchanged apart from using new lists)
+        # ------------------------------------------------------------------
+        subject_flame_params = self._load_subject_flame_params(
+            subject_frames_info[source_frame_indices[0]]["subject_flame_param_path"])
 
         source_images_list, source_cam_ids_list, source_img_tokens_list = [], [], []
         for s_idx in source_frame_indices:
             meta = subject_frames_info[s_idx]
-
             source_images_list.append(self._load_image_as_tensor(meta["image_file_path"]))
             npz_token = np.load(meta["token_file_path"])
-            img_token = torch.from_numpy(npz_token["tokens"])
-            source_img_tokens_list.append(img_token)
+            source_img_tokens_list.append(torch.from_numpy(npz_token["tokens"]))
             source_cam_ids_list.append(meta["cam_id"])
-
-        driving_indices_in_subject_list = []
-        if self.num_driving_frames > 0:
-            candidate_driving_indices = [i for i in range(len(subject_frames_info)) if i not in source_frame_indices]
-            if candidate_driving_indices:
-                if self.is_val:
-                    driving_indices_in_subject_list = candidate_driving_indices[:self.num_driving_frames]
-                    if driving_indices_in_subject_list:
-                        while len(driving_indices_in_subject_list) < self.num_driving_frames:
-                            driving_indices_in_subject_list.append(driving_indices_in_subject_list[-1])
-                else:
-                    driving_indices_in_subject_list = np.random.choice(
-                        candidate_driving_indices,
-                        size=self.num_driving_frames,
-                        replace=len(candidate_driving_indices) < self.num_driving_frames
-                    ).tolist()
 
         driving_images_list, driving_c2ws_list, driving_intrs_list, driving_cam_ids_list, driving_mask_list = [], [], [], [], []
         for d_idx in driving_indices_in_subject_list:
@@ -285,17 +286,16 @@ class CafcaLamDataset(Dataset):
             driving_images_list.append(self._load_image_as_tensor(meta["image_file_path"]))
             driving_mask_list.append(self._load_image_as_tensor(meta["mask_file_path"]))
             driving_c2ws_list.append(torch.from_numpy(meta["cam_2_world_np"]).float())
+
             intr_np = meta["intrinsic_np"]
             intr_torch = torch.eye(4, dtype=torch.float32)
-            if intr_np.shape == (3, 3):
-                intr_torch[:3, :3] = torch.from_numpy(intr_np)
-            elif intr_np.shape == (4, 4):
-                intr_torch = torch.from_numpy(intr_np)
-            else:
-                raise ValueError(f"Unexpected driving intrinsic shape: {intr_np.shape} for {meta['image_file_path']}")
+            intr_torch[:intr_np.shape[0], :intr_np.shape[1]] = torch.from_numpy(intr_np)
             driving_intrs_list.append(intr_torch)
             driving_cam_ids_list.append(meta["cam_id"])
 
+        # ------------------------------------------------------------------
+        # 5. assemble output dict  (unchanged)
+        # ------------------------------------------------------------------
         out_item = {
             "source_rgbs": torch.stack(source_images_list),
             "tokens": torch.stack(source_img_tokens_list),
@@ -311,10 +311,8 @@ class CafcaLamDataset(Dataset):
 
         out_item['betas'] = subject_flame_params['betas']
         for k, v_tensor in subject_flame_params.items():
-            if driving_images_list:
-                out_item[k] = v_tensor.unsqueeze(0).repeat(len(driving_images_list), 1)
-            elif self.num_driving_frames > 0:
-                out_item[k] = torch.empty(0, *v_tensor.shape)
+            out_item[k] = (v_tensor.unsqueeze(0).repeat(len(driving_images_list), 1)
+                        if driving_images_list else torch.empty(0, *v_tensor.shape))
 
         return out_item
 
