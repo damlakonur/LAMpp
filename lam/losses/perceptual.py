@@ -25,23 +25,33 @@ class LPIPSLoss(nn.Module):
     Compute LPIPS loss between two images.
     """
 
-    def __init__(self, device, prefech: bool = False):
+    def __init__(self, device, prefetch: bool = False):
         super().__init__()
-        self.device = device
-        self.cached_models = {}
-        if prefech:
+        self.device = torch.device(device)
+
+        self._cache: dict[str, nn.Module] = {}
+        if prefetch:
             self.prefetch_models()
 
-    def _get_model(self, model_name: str):
-        if model_name not in self.cached_models:
-            import warnings
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', category=UserWarning)
-                import lpips
-                _model = lpips.LPIPS(net=model_name, eval_mode=True, verbose=False).to(self.device)
-            _model = torch.compile(_model)
-            self.cached_models[model_name] = _model
-        return self.cached_models[model_name]
+    def _get_model(self, name: str) -> nn.Module:
+        if name in self._cache:
+            return self._cache[name]
+
+        # --- construct LPIPS net (eager, NOT compiled) -----------------
+        import warnings, lpips
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            net = lpips.LPIPS(net=name,
+                              eval_mode=True, verbose=False).to(self.device)
+
+        # move tiny shift / scale buffers to same device
+        s_layer = net.scaling_layer
+        s_layer.shift = s_layer.shift.to(self.device)
+        s_layer.scale = s_layer.scale.to(self.device)
+
+        net.requires_grad_(False)      # inference-only
+        self._cache[name] = net
+        return net
 
     def prefetch_models(self):
         _model_names = ['alex', 'vgg']
@@ -60,7 +70,7 @@ class LPIPSLoss(nn.Module):
         Returns:
             Mean-reduced LPIPS loss across batch.
         """
-        model_name = 'vgg' if is_training else 'alex'
+        model_name = 'alex' if is_training else 'vgg'
         loss_fn = self._get_model(model_name)
         EPS = 1e-7
         if len(x.shape) == 5:

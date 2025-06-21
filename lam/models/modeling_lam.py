@@ -223,8 +223,13 @@ class ModelLAM(nn.Module):
         assert len(flame_params["betas"].shape) == 2
         render_h, render_w = 512, 512
         query_points = None
-        # image_feats = image_feats.squeeze(1)
-        latent_points = latent_points.squeeze(1)
+        if latent_points.ndim >= 3:
+            n_src = latent_points.size(1)
+            if n_src == 2:
+                latent_points = latent_points.mean(dim=1, keepdim=False)
+
+            elif n_src == 1:
+                latent_points = latent_points.squeeze(1)
 
         if self.latent_query_points_type.startswith("e2e_flame"):
             query_points, flame_params = self.renderer.get_query_points(flame_params,

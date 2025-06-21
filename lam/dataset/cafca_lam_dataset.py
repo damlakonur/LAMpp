@@ -68,6 +68,7 @@ class CafcaLamDataset(Dataset):
                  num_source_frames: int = 1,
                  image_size: int = 512,
                  is_val: bool = False,
+                 max_tokens_in_ram: int = 128,
                  mode="lam_train"):
         """
         Dataset for loading preprocessed CAFCA data for LAM training/validation.
@@ -91,7 +92,7 @@ class CafcaLamDataset(Dataset):
         self.image_size = image_size
         self.is_val = is_val
         self._token_cache = OrderedDict()
-        self.max_tokens_in_ram = 128
+        self.max_tokens_in_ram = max_tokens_in_ram
         
         source_json_path = self.root_dir / "available_source_views.json"
         with open(source_json_path, "r") as f:

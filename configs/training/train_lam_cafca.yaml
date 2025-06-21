@@ -52,34 +52,37 @@ model:
   scale_sphere: false
 
 dataset:
-  cafca_subject_ids_train: [30, 31, 32, 33, 34, 35, 36, 41, 45]
-  cafca_subject_ids_val: [48, 49, 50, 51,  55]
+  cafca_subject_ids_train: [30, 31, 32, 33] #, 34, 35, 36, 41, 45
+  cafca_subject_ids_val: [55, 49] #, 50, 51,  48
   num_of_src_views: 1
   num_of_target_views: 4 # try 2-3 and increase batch size
-  max_tokens_in_ram: 128
+  max_tokens_in_ram: 64
 
 training:
   batch_size: 8
   num_epochs: 100
   learning_rate: 1e-5
   device: "cuda"
-  save_every_n_epochs: 1000
+  save_every_n_epochs: 20
   image_size: 512
-  num_workers: 6
+  num_workers: 2
   l1_loss_weight: 1.0
+  lpips_loss_weight: 1.0
+  silhouette_loss_weight: 1.0
+  offset_loss_weight: 0.1
   finetune_renderer_mlp_only: True
-  validate_every_n_epochs: 1000
+  validate_every_n_epochs: 1
   num_val_samples_to_log: 1
   num_train_samples_to_log: 1
 
 
 wandb:
-  enabled: false
+  enabled: true
   project: "lam-1-view-finetuning"
   entity: "gr-lampp"
-  run_name: "1-view_overfitting_b8_lr1e-5_6workers"
-  log_every_n_steps: 2
-  log_train_images_every_n_steps: 1000
+  run_name: "1-view_overfitting_b8_2workers_alex_wo_gs_net"
+  log_every_n_steps: 10
+  log_train_images_every_n_steps: 15
 
 profiler:
   is_enabled: false

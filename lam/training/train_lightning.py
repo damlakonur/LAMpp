@@ -96,9 +96,8 @@ def train(cfg: DictConfig):
         batch_size=cfg.training.batch_size,
         shuffle=True,
         num_workers=cfg.training.num_workers,
-        pin_memory=False,
+        pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=3
     )
     logger.info(f"Train dataset size: {len(train_dataset)}. Train Dataloader size: {len(train_dataloader)} batches.")
 
@@ -155,7 +154,6 @@ def train(cfg: DictConfig):
         max_epochs=cfg.training.get("num_epochs", 100),
         accelerator=cfg.training.device, 
         precision=cfg.training.get("precision", "16-mixed"), 
-        log_every_n_steps=cfg.wandb.log_every_n_steps,
         check_val_every_n_epoch=cfg.training.get("validate_every_n_epochs", 1.0),
         profiler= profiler if cfg.profiler.get("is_enabled") else None,
     )
