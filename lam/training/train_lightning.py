@@ -88,14 +88,15 @@ def train(cfg: DictConfig):
         num_source_frames=cfg.dataset.num_of_src_views,
         num_driving_frames=cfg.dataset.num_of_target_views,
         image_size=cfg.training.image_size,
-        is_val=False
+        is_val=False,
+        max_tokens_in_ram= cfg.dataset.get("max_tokens_in_ram", None)
     )
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=True,
         num_workers=cfg.training.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=True,
         prefetch_factor=3
     )
@@ -108,7 +109,8 @@ def train(cfg: DictConfig):
             num_source_frames=cfg.dataset.num_of_src_views,
             num_driving_frames=cfg.dataset.num_of_target_views,
             image_size=cfg.training.image_size,
-            is_val=True
+            is_val=True,
+            max_tokens_in_ram= cfg.dataset.get("max_tokens_in_ram", None)
         )
         val_dataloader = DataLoader(
             val_dataset,
@@ -182,7 +184,8 @@ if __name__ == "__main__":
     #     num_source_frames=cfg.dataset.num_of_src_views,
     #     num_driving_frames=cfg.dataset.num_of_target_views,
     #     image_size=cfg.training.image_size,
-    #     is_val=False
+    #     is_val=False,
+    #     max_tokens_in_ram= cfg.dataset.get("max_tokens_in_ram", None)
     # )
     # train_dataloader = DataLoader(
     #     train_dataset,
@@ -201,22 +204,13 @@ if __name__ == "__main__":
     #     num_threads=1,
     # )
 
-    # timer_prep = benchmark.Timer(
-    #     stmt="""\
-    # batch_gpu = prepare_batch_for_model(batch_cpu, device)
-    # torch.cuda.synchronize()
-    # """,
-    #     setup="""\
-    # from __main__ import prepare_batch_for_model
-    # device = torch.device('cuda')
+    # print("DataLoader only :", timer_load.timeit(10))
     # loader_iter = iter(train_dataloader)
     # batch_cpu = next(loader_iter)
-    # """,
-    #     globals={"train_dataloader": train_dataloader},
-    #     num_threads=1,
-    # )
 
-    # print("DataLoader only :", timer_load.timeit(20))
-    # print("Prepare only    :", timer_prep.timeit(20))
+    # t0 = time.time()
+    # batch_gpu = {k: v.cuda(non_blocking=True) if torch.is_tensor(v) else v
+    #             for k, v in batch_cpu.items()}
+    # torch.cuda.synchronize()
+    # print("copy time:", time.time() - t0)
 
-    # print(t.timeit(10))
