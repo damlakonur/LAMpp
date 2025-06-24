@@ -115,11 +115,16 @@ class Camera:
 
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy, device=w2c.device).transpose(0,1)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
-        self.camera_center = self.world_view_transform.inverse()[3, :3]
+        # overkill
+        # self.camera_center = self.world_view_transform.inverse()[3, :3]
+        R = w2c[..., :3, :3]
+        t = w2c[..., :3, 3]
+        self.camera_center = -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1).float()
 
     @staticmethod
-    def from_c2w(c2w, intrinsic, height, width):
-        w2c = torch.inverse(c2w)
+    # @torch.compile
+    def from_c2w(w2c, intrinsic, height, width):
+        # w2c = torch.inverse(c2w)
         FoVx, FoVy = intrinsic_to_fov(intrinsic, w=torch.tensor(width, device=w2c.device), h=torch.tensor(height, device=w2c.device))
         return Camera(w2c=w2c, intrinsic=intrinsic, FoVx=FoVx, FoVy=FoVy, height=height, width=width)
 
@@ -673,7 +678,7 @@ class GS3DRenderer(nn.Module):
     def forward_single_batch(
         self,
         gs_list: list[GaussianModel],
-        c2ws: Float[Tensor, "Nv 4 4"],
+        w2cs: Float[Tensor, "Nv 4 4"],
         intrinsics: Float[Tensor, "Nv 4 4"],
         height: int,
         width: int,
@@ -682,10 +687,10 @@ class GS3DRenderer(nn.Module):
     ):
         out_list = []
         self.device = gs_list[0].xyz.device
-        for v_idx, (c2w, intrinsic) in enumerate(zip(c2ws, intrinsics)):
+        for v_idx, (w2c, intrinsic) in enumerate(zip(w2cs, intrinsics)):
             out_list.append(self.forward_single_view(
                                 gs_list[v_idx], 
-                                Camera.from_c2w(c2w, intrinsic, height, width),
+                                Camera.from_c2w(w2c, intrinsic, height, width),
                                 background_color[v_idx] if background_color is not None else torch.tensor([0.,0.,0.], device=self.device),
                             ))
         
@@ -695,6 +700,10 @@ class GS3DRenderer(nn.Module):
                 out[k].append(v)
         out = {k: torch.stack(v, dim=0) for k, v in out.items()}
         out["3dgs"] = gs_list
+        offsets = [gs.offset if gs.offset is not None else torch.zeros_like(gs.xyz)
+                for gs in gs_list]
+
+        out["offset"] = torch.stack(offsets, dim=0)
 
         return out
 
@@ -764,7 +773,7 @@ class GS3DRenderer(nn.Module):
             gs_model_list.append(gs_model)
         return gs_model_list, query_points, flame_data, query_gs_features
 
-    def forward_animate_gs(self, gs_model_list, query_points, flame_data, c2w, intrinsic, height, width,
+    def forward_animate_gs(self, gs_model_list, query_points, flame_data, w2c, intrinsic, height, width,
                            background_color, debug=False):
         batch_size = len(gs_model_list)
         out_list = []
@@ -777,10 +786,10 @@ class GS3DRenderer(nn.Module):
                                                                                   query_pt,
                                                                                   self.get_sing_batch_smpl_data(flame_data, b),
                                                                                   debug=debug)
-            assert len(animatable_gs_model_list) == c2w.shape[1]
+            assert len(animatable_gs_model_list) == w2c.shape[1]
             out_list.append(self.forward_single_batch(
                 animatable_gs_model_list,
-                c2w[b],
+                w2c[b],
                 intrinsic[b],
                 height, width,
                 background_color[b] if background_color is not None else None, 
@@ -796,7 +805,7 @@ class GS3DRenderer(nn.Module):
             else:
                 out[k] = v
                 
-        render_keys = ["comp_rgb", "comp_mask", "comp_depth"]
+        render_keys = ["comp_rgb", "comp_mask"] # , "comp_depth"
         for key in render_keys:
             out[key] = rearrange(out[key], "b v h w c -> b v c h w")
         
@@ -839,7 +848,7 @@ class GS3DRenderer(nn.Module):
         gs_hidden_features: Float[Tensor, "B Np Cp"],
         query_points: Float[Tensor, "B Np 3"],
         flame_data,  # e.g., body_pose:[B, Nv, 21, 3], betas:[B, 100]
-        c2w: Float[Tensor, "B Nv 4 4"],
+        w2c: Float[Tensor, "B Nv 4 4"],
         intrinsic: Float[Tensor, "B Nv 4 4"],
         height,
         width,
@@ -853,7 +862,7 @@ class GS3DRenderer(nn.Module):
         gs_model_list, query_points, flame_data, query_gs_features = self.forward_gs(gs_hidden_features, query_points, flame_data=flame_data,
                                                                       additional_features=additional_features, debug=debug)
         # with torch.autograd.profiler.record_function("forward_animate_gs"):
-        out = self.forward_animate_gs(gs_model_list, query_points, flame_data, c2w, intrinsic, height, width, background_color, debug)
+        out = self.forward_animate_gs(gs_model_list, query_points, flame_data, w2c, intrinsic, height, width, background_color, debug)
         
         return out
 

@@ -219,7 +219,7 @@ class ModelLAM(nn.Module):
 
         return tokens, image_feats
 
-    def forward(self, render_c2ws, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
+    def forward(self, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
         assert len(flame_params["betas"].shape) == 2
         render_h, render_w = 512, 512
         query_points = None
@@ -233,11 +233,11 @@ class ModelLAM(nn.Module):
 
         if self.latent_query_points_type.startswith("e2e_flame"):
             query_points, flame_params = self.renderer.get_query_points(flame_params,
-                                                                        device=render_c2ws.device)
+                                                                        device=render_w2cs.device)
         render_results = self.renderer(gs_hidden_features=latent_points,
                                        query_points=query_points,
                                        flame_data=flame_params,
-                                       c2w=render_c2ws,
+                                       w2c=render_w2cs,
                                        intrinsic=render_intrs,
                                        height=render_h,
                                        width=render_w,
@@ -245,12 +245,12 @@ class ModelLAM(nn.Module):
                                        additional_features=None
         )
 
-        N, M = render_c2ws.shape[:2]
+        N, M = render_w2cs.shape[:2]
         assert render_results['comp_rgb'].shape[0] in [N, N], "Batch size mismatch for render_results"
         assert render_results['comp_rgb'].shape[1] in [M, M*2], "Number of rendered views should be consistent with render_cameras"
 
         return {
-            'latent_points': latent_points,
+            # 'latent_points': latent_points,
             **render_results,
         }
         

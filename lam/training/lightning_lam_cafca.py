@@ -90,17 +90,17 @@ class LamLightningModel(pl.LightningModule):
             image=batch["image"],
             source_c2ws=batch["source_c2ws"],
             source_intrs=batch["source_intrs"],
-            render_c2ws=batch["render_c2ws"],
+            render_w2cs=batch["render_w2cs"],
             render_intrs=batch["render_intrs"],
             flame_params=batch["flame_params"],
             render_bg_colors=batch["render_bg_colors"]
         )
 
     def training_step(self, batch, batch_idx):
-        bs = batch["render_c2ws"].size(0)
+        bs = batch["render_w2cs"].size(0)
 
         model_output = self.model(
-            render_c2ws=batch["render_c2ws"],
+            render_w2cs=batch["render_w2cs"],
             render_intrs=batch["render_intrs"],
             flame_params=batch["flame_params"],
             latent_points=batch.get("latent_points"),
@@ -126,15 +126,15 @@ class LamLightningModel(pl.LightningModule):
         self.log("train/offset_loss",loss_offset,  on_step=True, batch_size=bs)
         self.log('learning_rate', self.optimizers().param_groups[0]['lr'], on_step=True, on_epoch=False)
 
-        if (self.global_step + 1) % self.trainer.num_training_batches == 0:
-            self._log_image_samples(batch, pred_rgb, gt_rgb, "train")
+        # if (self.global_step + 1) % self.trainer.num_training_batches == 0:
+        #     self._log_image_samples(batch, pred_rgb, gt_rgb, "train")
 
         return total_loss
 
     def validation_step(self, batch, batch_idx):
 
         model_output = self.model(
-            render_c2ws=batch["render_c2ws"],
+            render_w2cs=batch["render_w2cs"],
             render_intrs=batch["render_intrs"],
             flame_params=batch["flame_params"],
             latent_points=batch.get("latent_points"),
@@ -167,8 +167,8 @@ class LamLightningModel(pl.LightningModule):
         self.log("val/offset_loss",loss_offset,  on_step=False, on_epoch=True)
         self.log("val/psnr", psnr_val, on_step=False, on_epoch=True, batch_size=pred_flat.size(0))
         self.log("val/ssim", ssim_val, on_step=False, on_epoch=True, batch_size=pred_flat.size(0))
-        if batch_idx == 0: 
-            self._log_image_samples(batch, pred_rgb, gt_rgb, "val")
+        # if batch_idx == 0: 
+        #     self._log_image_samples(batch, pred_rgb, gt_rgb, "val")
 
         return total_loss
 

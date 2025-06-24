@@ -9,58 +9,10 @@ import json
 from torch.utils.data import Dataset
 from lam.dataset import env_paths
 import numpy as np
-import cv2
 from torchvision.io import read_image
 from collections import OrderedDict
 
 import traceback
-from lam.runners.infer.head_utils import img_center_padding, center_crop_according_to_mask,  calc_new_tgt_size_by_aspect
-
-def preprocess_image(rgb_img, mask_img, pad_ratio, bg_color, 
-                    aspect_standard, enlarge_ratio,
-                    render_tgt_size, multiply, need_mask=True):
-    rgb = np.array(rgb_img)
-    rgb_raw = rgb.copy()
-    if pad_ratio > 0:
-        rgb = img_center_padding(rgb, pad_ratio)
-
-    rgb = rgb / 255.0
-    if need_mask:
-        if rgb.shape[2] < 4:
-            if mask_img is not None:
-                mask = (np.array(mask_img) > 180) * 255
-            if pad_ratio > 0:
-                mask = img_center_padding(mask, pad_ratio)
-            mask = mask / 255.0
-        else:
-            # rgb: [H, W, 4]
-            assert rgb.shape[2] == 4
-            mask = rgb[:, :, 3]   # [H, W]
-    else:
-        # just placeholder
-        mask = np.ones_like(rgb[:, :, 0])
-    if len(mask.shape) > 2:
-        mask = mask[:, :, 0]
-
-    mask = mask.astype(np.float32)
-    if (rgb.shape[0] == rgb.shape[1]) and (rgb.shape[0]==512):
-        rgb = cv2.resize(rgb, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_AREA)
-    rgb = rgb[:, :, :3] * mask[:, :, None] + bg_color * (1 - mask[:, :, None])
-
-    # crop image to enlarge human area.
-    rgb, mask, _, _ = center_crop_according_to_mask(rgb, mask, aspect_standard, enlarge_ratio)
-
-    # resize to render_tgt_size for training
-    tgt_hw_size, _, _ = calc_new_tgt_size_by_aspect(cur_hw=rgb.shape[:2], 
-                                                    aspect_standard=aspect_standard,
-                                                    tgt_size=render_tgt_size, multiply=multiply)
-    rgb = cv2.resize(rgb, dsize=(tgt_hw_size[1], tgt_hw_size[0]), interpolation=cv2.INTER_AREA)
-    mask = cv2.resize(mask, dsize=(tgt_hw_size[1], tgt_hw_size[0]), interpolation=cv2.INTER_AREA)
-
-    rgb = torch.from_numpy(rgb).float().permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
-    mask = torch.from_numpy(mask[:, :, None]).float().permute(2, 0, 1).unsqueeze(0)  # [1, 1, H, W]
-
-    return rgb, mask
 
 class CafcaLamDataset(Dataset):
     def __init__(self, subject_list,
@@ -164,8 +116,8 @@ class CafcaLamDataset(Dataset):
 
                     if "K" not in cam_params:
                         raise KeyError(f"'K' key not found in camera file {cam_json_file}")
-                    if "cam2world" not in cam_params:
-                        raise KeyError(f"'cam2world' key not found in camera file {cam_json_file}")
+                    if "world2cam" not in cam_params:
+                        raise KeyError(f"'world2cam' key not found in camera file {cam_json_file}")
 
                     frame_data = {
                         "subject_id_int": subject_int,
@@ -173,8 +125,8 @@ class CafcaLamDataset(Dataset):
                         "image_file_path": str(image_file),
                         "mask_file_path": str(mask_file),
                         "subject_flame_param_path": str(flame_params_path),
-                        "cam_2_world_np": np.array(cam_params["cam2world"], dtype=np.float32),
-                        "intrinsic_np": np.array(cam_params["K"], dtype=np.float32),
+                        "world_2_cam_np": np.array(cam_params["world2cam"], dtype=np.float16),
+                        "intrinsic_np": np.array(cam_params["K"], dtype=np.float16),
                         "token_file_path": str(token_file),
                         "is_source_candidate": cam_id in self.allowed_source_cams.get(subject_int, set()),
                     }
@@ -203,8 +155,9 @@ class CafcaLamDataset(Dataset):
         cache = self._token_cache
         if path in cache:
             cache.move_to_end(path)
+            print(f"Cache hit ##############.")
             return cache[path]
-
+        print(f"Cache miss ##############. Loading into cache.")
         npz = np.load(path, mmap_mode='r')
         tensor = torch.from_numpy(npz["tokens"])
 
@@ -303,17 +256,19 @@ class CafcaLamDataset(Dataset):
             # npz_token = np.load(meta["token_file_path"], mmap_mode='r')
             # source_img_tokens_list.append(torch.from_numpy(npz_token["tokens"]))
             source_img_tokens_list.append(self._get_token_tensor(meta["token_file_path"]))
+            # source_img_tokens_list.append(torch.zeros((20018, 1024), dtype=torch.float16))
             source_cam_ids_list.append(meta["cam_id"])
 
-        driving_images_list, driving_c2ws_list, driving_intrs_list, driving_cam_ids_list, driving_mask_list = [], [], [], [], []
+        driving_images_list, driving_w2cs_list, driving_intrs_list, driving_cam_ids_list, driving_mask_list = [], [], [], [], []
         for d_idx in driving_indices_in_subject_list:
             meta = subject_frames_info[d_idx]
             driving_images_list.append(self._load_image_as_tensor(meta["image_file_path"]))
             driving_mask_list.append(self._load_image_as_tensor(meta["mask_file_path"]))
-            driving_c2ws_list.append(torch.from_numpy(meta["cam_2_world_np"]).float())
+            driving_w2cs_list.append(torch.from_numpy(meta["world_2_cam_np"]).float())
+
 
             intr_np = meta["intrinsic_np"]
-            intr_torch = torch.eye(4, dtype=torch.float32)
+            intr_torch = torch.eye(4, dtype=torch.float16)
             intr_torch[:intr_np.shape[0], :intr_np.shape[1]] = torch.from_numpy(intr_np)
             driving_intrs_list.append(intr_torch)
             driving_cam_ids_list.append(meta["cam_id"])
@@ -325,7 +280,7 @@ class CafcaLamDataset(Dataset):
             "source_rgbs": torch.stack(source_images_list),
             "tokens": torch.stack(source_img_tokens_list),
             "driving_image": torch.stack(driving_images_list),
-            "driving_c2ws": torch.stack(driving_c2ws_list),
+            "driving_w2cs": torch.stack(driving_w2cs_list),
             "driving_intrs": torch.stack(driving_intrs_list),
             "driving_masks": torch.stack(driving_mask_list),
             "render_bg_colors": torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).repeat(len(driving_images_list), 1),

@@ -3,24 +3,103 @@ import sys
 import logging
 import traceback
 from pathlib import Path
-import datetime
+from safetensors.torch import load_file
 
 import torch
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf, DictConfig
 from tqdm import tqdm
-import math
+import numpy as np
 
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
-from lam.dataset.cafca_lam_dataset import CafcaLamDataset
+from lam.dataset.cafca_dataset_precompute import CafcaDatasetPP
 from lam.models.modeling_lam import ModelLAM
-from lam.training.train_lam_cafca import prepare_batch_for_model, get_logger as get_train_logger, _build_model
+from lam.training.train_lam_cafca import get_logger as get_train_logger
 from lam.dataset import env_paths
 
 logger = get_train_logger(__name__)
+
+def prepare_batch_for_model(batch_from_dataloader, device):
+    """
+    Prepares a batch of data from CafcaLamDataset (already batched by DataLoader)
+    for input to ModelLAM. Moves tensors to device and structures them as expected by the model.
+    Casts image-related tensors to float32 to avoid dtype issues in torch.compile.
+    """
+    def _move(x, dtype=None):
+        """Pinned-memory -> GPU async copy; optional fused cast."""
+        if torch.is_tensor(x):
+            return x.to(device=device, dtype=dtype or x.dtype, non_blocking=True)
+        return x 
+
+    # # Source data for encoding
+    prepared_batch = {}
+    prepared_batch["image"] = _move(batch_from_dataloader["source_rgbs"])
+
+
+    # FLAME parameters
+    flame_params_for_model = {}
+    flame_keys_base = ["expr", "rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation"]
+
+    betas = batch_from_dataloader["betas"]
+    if betas.ndim == 3:  # [B, N_render, D]
+        betas = betas[:, 0, :]
+    flame_params_for_model["betas"] = betas.to(device).float()  # [B, D]
+
+    for key in flame_keys_base:
+        if key in batch_from_dataloader:
+            flame_params_for_model[key] = batch_from_dataloader[key].to(device).float()
+
+    prepared_batch["flame_params"] = flame_params_for_model
+
+    # Optional UID
+    if "uid" in batch_from_dataloader:
+        prepared_batch["uid"] = batch_from_dataloader["uid"]
+
+    return prepared_batch
+
+def _build_model(cfg: DictConfig):
+    model = ModelLAM(**cfg.model)
+    resume = os.path.join(cfg.experiment.model_name, "model.safetensors")
+    print("==="*16*3)
+    print("loading pretrained weight from:", resume)
+    if resume.endswith('safetensors'):
+        ckpt = load_file(resume, device='cpu')
+    else:
+        ckpt = torch.load(resume, map_location='cpu')
+    state_dict = model.state_dict()
+    for k, v in ckpt.items():
+        if k in state_dict:
+            if state_dict[k].shape == v.shape:
+                state_dict[k].copy_(v)
+            else:
+                print(f"WARN] mismatching shape for param {k}: ckpt {v.shape} != model {state_dict[k].shape}, ignored.")
+        else:
+            print(f"WARN] unexpected param {k}: {v.shape}")
+    print("finish loading pretrained weight from:", resume)
+    print("==="*16*3)
+
+    # Fine-tuning: Freeze parameters if finetune_renderer_mlp_only is True
+    if cfg.training.get("finetune_renderer_mlp_only", False):
+        logger.info("Fine-tuning mode: Freezing all parameters except renderer.mlp_net.")
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+        
+        if hasattr(model, 'renderer') and hasattr(model.renderer, 'mlp_net') and model.renderer.mlp_net is not None:
+            for param in model.renderer.mlp_net.parameters():
+                param.requires_grad = True
+            logger.info("Unfroze parameters of model.renderer.mlp_net.")
+        # if hasattr(model, 'renderer') and hasattr(model.renderer, 'gs_net') and model.renderer.gs_net is not None:
+        #     for param in model.renderer.gs_net.parameters():
+        #         param.requires_grad = True
+        #     logger.info("Unfroze parameters of model.renderer.gs_net.")
+        else:
+            logger.warning("model.renderer.mlp_net not found or is None. "
+                            "No parameters specifically unfrozen for MLP fine-tuning. "
+                            "Ensure model config `gs_mlp_network_config` is set if MLP is expected.")
+    return model
 
 def precompute_and_save_batch(
     model: ModelLAM,
@@ -71,18 +150,22 @@ def precompute_and_save_batch(
             / f"{env_paths.EXPRESSION_ID}_{env_paths.ENVIRONMENT_ID}"
         )
 
-        image_feats_target_dir = current_sample_subject_output_dir / "image_feats"
+        # image_feats_target_dir = current_sample_subject_output_dir / "image_feats"
         tokens_target_dir = current_sample_subject_output_dir / "tokens"
-        image_feats_target_dir.mkdir(parents=True, exist_ok=True)
+        # image_feats_target_dir.mkdir(parents=True, exist_ok=True)
         tokens_target_dir.mkdir(parents=True, exist_ok=True)
 
         sanitized_camera_id = source_camera_id_sample.replace('/', '_')
         
-        sample_image_feat_path = image_feats_target_dir / f"{sanitized_camera_id}.pt"
-        sample_token_path = tokens_target_dir / f"{sanitized_camera_id}.pt"
+        # sample_image_feat_path = image_feats_target_dir / f"{sanitized_camera_id}.npz"
+        sample_token_path = tokens_target_dir / f"{sanitized_camera_id}.npz"
 
-        torch.save(image_feats_batch[i].cpu(), sample_image_feat_path)
-        torch.save(tokens_batch[i].cpu(), sample_token_path)
+        # torch.save(image_feats_batch[i].cpu(), sample_image_feat_path)
+        # torch.save(tokens_batch[i].cpu(), sample_token_path)
+        # image_feat_np = image_feats_batch[i].detach().cpu().numpy().astype(np.float16)
+        tokens_np = tokens_batch[i].detach().cpu().numpy().astype(np.float16)
+        # np.savez_compressed(sample_image_feat_path, image_feats=image_feat_np)
+        np.savez_compressed(sample_token_path, tokens=tokens_np)
         logger.debug(f"Saved features for subject {subject_id_str_sample}, camera {source_camera_id_sample} to {current_sample_subject_output_dir}")
     logger.info(f"Processed and saved features for batch {batch_idx}")
 
@@ -94,7 +177,7 @@ def precompute_features_main(cfg: DictConfig):
     logger.info(f"Using device: {device}")
 
     logger.info("Initializing dataset for precomputation...")
-    dataset = CafcaLamDataset(
+    dataset = CafcaDatasetPP(
         subject_list=list(cfg.dataset.cafca_subject_ids_train),
         num_source_frames=cfg.dataset.num_of_src_views,
         num_driving_frames=cfg.dataset.num_of_target_views,
