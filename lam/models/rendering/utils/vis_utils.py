@@ -77,7 +77,7 @@ def vis_keypoints(img, kps, alpha=1):
 
 
 def render_mesh(mesh, face, cam_param, bkg, blend_ratio=1.0, return_bg_mask=False, R=None, T=None, return_fragments=False):
-    mesh = mesh.cuda()[None,:,:]
+    mesh = mesh.cuda().unsqueeze(0)
     face = torch.LongTensor(face.astype(np.int64)).cuda()[None,:,:]
     cam_param = {k: v.cuda()[None,:] for k,v in cam_param.items()}
     render_shape = (bkg.shape[0], bkg.shape[1]) # height, width

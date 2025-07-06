@@ -2,7 +2,7 @@ from dreifus.camera import CameraCoordinateConvention
 
 CODE_BASE = "/home/dkonur/3DSSL-WS24_Generative3DHeads"
 DATA_DIR = "/home/cafca_dataset"
-FLAME_FILENAME = "_1stage_tracked_flame_params.npz"
+FLAME_FILENAME = "_1stage_flame_params.npz"
 EXPRESSION_ID = "00000"
 ENVIRONMENT_ID = "000"
 CAMERA_CONVENTION = CameraCoordinateConvention.OPEN_CV
@@ -16,4 +16,4 @@ CAMERA_CONVENTION = CameraCoordinateConvention.OPEN_CV
 
 # [201, 204, 205, 206, 208, 211, 212, 213, 215, 218, 219, 220, 221, 222, 224, 225, 226, 227, 228, 230, 232, 233, 234, 235, 236, 238, 239, 240, 241, 243, 244, 245, 246, 247, 248, 249, 251, 252, 253, 254, 255, 256, 257, 259, 260, 261, 264, 266, 267, 272, 274, 275, 277, 281, 283, 284, 285, 286, 289, 290, 291, 293, 294, 295, 296, 297, 298]
 subjects_eval = []
-subjects_train = [30]
+subjects_train = [33]

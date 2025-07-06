@@ -2,7 +2,8 @@ import os
 import sys
 import logging
 from pathlib import Path
-import time
+import random
+import numpy as np
 
 import torch
 from torch.utils.data import DataLoader
@@ -67,7 +68,15 @@ logger = get_logger(__name__)
 def train(cfg: DictConfig):
     """Main training loop using PyTorch Lightning."""
     exp_name = cfg.experiment.name
-    
+    SEED = 12345
+    pl.seed_everything(SEED, workers=True)
+
+    def seed_worker(worker_id):
+        worker_seed = SEED + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    torch_gen = torch.Generator().manual_seed(SEED)
     # WandB Logger
     wandb_logger = None
     if cfg.wandb.enabled:
@@ -95,9 +104,12 @@ def train(cfg: DictConfig):
         train_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=True,
+        generator=torch_gen,
+        worker_init_fn=seed_worker,
         num_workers=cfg.training.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=True,
+        # prefetch_factor=3
     )
     logger.info(f"Train dataset size: {len(train_dataset)}. Train Dataloader size: {len(train_dataloader)} batches.")
 
@@ -114,8 +126,10 @@ def train(cfg: DictConfig):
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=cfg.training.batch_size,
-            shuffle=False,
-            num_workers=cfg.training.num_workers,
+            shuffle=True,
+            generator=torch_gen,
+            worker_init_fn=seed_worker,
+            num_workers=2,
         )
         logger.info(f"Validation dataset size: {len(val_dataset)}. Val Dataloader size: {len(val_dataloader)} batches.")
 
@@ -155,7 +169,7 @@ def train(cfg: DictConfig):
         accelerator=cfg.training.device, 
         precision=cfg.training.get("precision", "16-mixed"), 
         check_val_every_n_epoch=cfg.training.get("validate_every_n_epochs", 1.0),
-        profiler= profiler if cfg.profiler.get("is_enabled") else None,
+        # profiler= profiler if cfg.profiler.get("is_enabled") else None,
     )
 
     trainer.fit(model=lightning_model, 
@@ -176,39 +190,4 @@ if __name__ == "__main__":
     logger.info("Configuration loaded:")
     logger.info(OmegaConf.to_yaml(cfg))
     train(cfg)
-
-    # train_dataset = CafcaLamDataset(
-    #     subject_list=list(cfg.dataset.cafca_subject_ids_train),
-    #     num_source_frames=cfg.dataset.num_of_src_views,
-    #     num_driving_frames=cfg.dataset.num_of_target_views,
-    #     image_size=cfg.training.image_size,
-    #     is_val=False,
-    #     max_tokens_in_ram= cfg.dataset.get("max_tokens_in_ram", None)
-    # )
-    # train_dataloader = DataLoader(
-    #     train_dataset,
-    #     batch_size=cfg.training.batch_size,
-    #     shuffle=True,
-    #     num_workers=cfg.training.num_workers,
-    #     pin_memory=True,
-    #     persistent_workers=True,
-    #     prefetch_factor=3
-    # )
-    # logger.info(f"Train dataset size: {len(train_dataset)}. Train Dataloader size: {len(train_dataloader)} batches.")
-    # timer_load = benchmark.Timer(
-    #     stmt="next(loader_iter)",
-    #     setup="loader_iter = iter(train_dataloader)",
-    #     globals={"train_dataloader": train_dataloader},
-    #     num_threads=1,
-    # )
-
-    # print("DataLoader only :", timer_load.timeit(10))
-    # loader_iter = iter(train_dataloader)
-    # batch_cpu = next(loader_iter)
-
-    # t0 = time.time()
-    # batch_gpu = {k: v.cuda(non_blocking=True) if torch.is_tensor(v) else v
-    #             for k, v in batch_cpu.items()}
-    # torch.cuda.synchronize()
-    # print("copy time:", time.time() - t0)
 

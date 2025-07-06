@@ -27,6 +27,8 @@ logger = get_logger(__name__)
 
 class LamLightningModel(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
+        if not isinstance(cfg, DictConfig):
+            cfg = OmegaConf.create(cfg) 
         super().__init__()
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
         self.cfg = cfg
@@ -74,6 +76,17 @@ class LamLightningModel(pl.LightningModule):
                 for param in model.renderer.mlp_net.parameters():
                     param.requires_grad = True
                 logger.info("Unfroze parameters of model.renderer.mlp_net.")
+            if hasattr(model, 'fusion_layer') and model.fusion_layer is not None:
+                for param in model.fusion_layer.parameters():
+                    param.requires_grad = True
+                    # param.data.zero_()
+                logger.info("Unfroze parameters of model.fusion_layer.")
+                logger.info(param.data)
+            # if hasattr(model, 'layer_norm') and model.layer_norm is not None:
+            #     for param in model.layer_norm.parameters():
+            #         param.requires_grad = True
+            #     logger.info("Unfroze parameters of model.layer_norm.")
+            
             # if hasattr(model, 'renderer') and hasattr(model.renderer, 'gs_net') and model.renderer.gs_net is not None:
             #     for param in model.renderer.gs_net.parameters():
             #         param.requires_grad = True
@@ -87,18 +100,15 @@ class LamLightningModel(pl.LightningModule):
     def forward(self, batch):
         # model_input_data = prepare_batch_for_model(batch, self.device)
         return self.model(
-            image=batch["image"],
-            source_c2ws=batch["source_c2ws"],
-            source_intrs=batch["source_intrs"],
             render_w2cs=batch["render_w2cs"],
             render_intrs=batch["render_intrs"],
             flame_params=batch["flame_params"],
+            latent_points=batch.get("latent_points"),
             render_bg_colors=batch["render_bg_colors"]
         )
 
     def training_step(self, batch, batch_idx):
         bs = batch["render_w2cs"].size(0)
-
         model_output = self.model(
             render_w2cs=batch["render_w2cs"],
             render_intrs=batch["render_intrs"],
@@ -126,8 +136,8 @@ class LamLightningModel(pl.LightningModule):
         self.log("train/offset_loss",loss_offset,  on_step=True, batch_size=bs)
         self.log('learning_rate', self.optimizers().param_groups[0]['lr'], on_step=True, on_epoch=False)
 
-        # if (self.global_step + 1) % self.trainer.num_training_batches == 0:
-        #     self._log_image_samples(batch, pred_rgb, gt_rgb, "train")
+        if (self.global_step + 1) % self.trainer.num_training_batches == 0:
+            self._log_image_samples(batch, pred_rgb, gt_rgb, "train")
 
         return total_loss
 
@@ -167,8 +177,8 @@ class LamLightningModel(pl.LightningModule):
         self.log("val/offset_loss",loss_offset,  on_step=False, on_epoch=True)
         self.log("val/psnr", psnr_val, on_step=False, on_epoch=True, batch_size=pred_flat.size(0))
         self.log("val/ssim", ssim_val, on_step=False, on_epoch=True, batch_size=pred_flat.size(0))
-        # if batch_idx == 0: 
-        #     self._log_image_samples(batch, pred_rgb, gt_rgb, "val")
+        if batch_idx == 0: 
+            self._log_image_samples(batch, pred_rgb, gt_rgb, "val")
 
         return total_loss
 

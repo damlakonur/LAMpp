@@ -1,0 +1,340 @@
+
+import csv
+import torch
+import os
+import argparse
+import numpy as np
+from PIL import Image
+from omegaconf import OmegaConf
+from tqdm.auto import tqdm
+from accelerate.logging import get_logger
+from pathlib import Path
+
+
+from lam.runners.infer.head_utils import preprocess_image, load_flame_params
+
+
+from .base_inferrer import Inferrer
+from lam.runners import REGISTRY_RUNNERS
+from safetensors.torch import load_file
+from lam.dataset import env_paths
+from lam.dataset.cafca_dataset import CafcaDataset
+from torchmetrics.image import (
+    PeakSignalNoiseRatio as PSNR,
+    StructuralSimilarityIndexMeasure as SSIM,
+)
+from lam.losses import LPIPSLoss, PixelLoss
+
+
+logger = get_logger(__name__)
+
+
+def parse_configs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str)
+    parser.add_argument('--infer', type=str)
+    args, unknown = parser.parse_known_args()
+
+    cfg = OmegaConf.create()
+    cli_cfg = OmegaConf.from_cli(unknown)
+
+    if args.config is not None:
+        cfg = OmegaConf.load(args.config)
+        cfg_train = OmegaConf.load(args.config)
+        cfg.source_size = cfg_train.dataset.source_image_res
+        cfg.render_size = cfg_train.dataset.render_image.high
+        _relative_path = os.path.join(
+            cfg_train.experiment.parent,
+            cfg_train.experiment.child,
+            os.path.basename(cli_cfg.model_name).split('_')[-1]
+        )
+        cfg.save_tmp_dump = os.path.join("exps", 'save_tmp', _relative_path)
+        cfg.image_dump    = os.path.join("exps", 'images', _relative_path)
+        cfg.video_dump    = os.path.join("exps", 'videos', _relative_path)
+        cfg.mesh_dump     = os.path.join("exps", 'meshes', _relative_path)
+
+    if args.infer is not None:
+        cfg_infer = OmegaConf.load(args.infer)
+        cfg.merge_with(cfg_infer)
+        cfg.setdefault("save_tmp_dump", os.path.join("exps", cli_cfg.model_name, 'save_tmp'))
+        cfg.setdefault("image_dump",    os.path.join("exps", cli_cfg.model_name, 'images'))
+        cfg.setdefault("video_dump",    os.path.join("dumps", cli_cfg.model_name, 'videos'))
+        cfg.setdefault("mesh_dump",     os.path.join("dumps", cli_cfg.model_name, 'meshes'))
+
+    cfg.motion_video_read_fps = 6
+    cfg.merge_with(cli_cfg)
+    cfg.setdefault("save_img", True) 
+    cfg.setdefault('use_cafca_dataset', True)
+    cfg.setdefault('cafca_subject_id_for_single_infer', None)
+    cfg.setdefault('cafca_camera_id_for_single_infer', None)
+    cfg.setdefault('cafca_driving_camera_id_for_single', None)
+    cfg.setdefault('logger', 'INFO')
+
+    assert cfg.model_name is not None, "model_name is required"
+    if not cfg.get('use_cafca_dataset', False):
+        assert cfg.image_input is not None, "image_input is required"
+        assert cfg.export_video or cfg.export_mesh, \
+            "At least one of export_video or export_mesh should be True"
+        cfg.app_enabled = False
+    else:
+        cfg.app_enabled = True
+
+    return cfg
+
+
+
+@REGISTRY_RUNNERS.register('infer.baseline')
+class LAMInferrer(Inferrer):
+
+    EXP_TYPE: str = 'baseline'
+
+    def __init__(self):
+        super().__init__()
+
+        self.cfg = parse_configs()
+        """
+        configure_logger(
+            stream_level=self.cfg.logger,
+            log_level=self.cfg.logger,
+        )
+        """
+
+        self.model: LAMInferrer = self._build_model(self.cfg).to(self.device)
+        eval_subjects = [32] #, 31, 32, 33, 34, 35, 36, 41, 45, 50, 51, 55
+        self.l1_loss_fn    = torch.nn.L1Loss()
+        self.lpips_loss_fn = LPIPSLoss(device='cuda', prefetch=True)
+        self.psnr_metric   = PSNR(data_range=1.0).to('cuda')
+        self.ssim_metric   = SSIM(data_range=1.0).to('cuda')
+
+        self.cafca_loader = None
+        if self.cfg.get('use_cafca_dataset', False):
+            logger.info("Initializing CafcaLamDataset for LAM inference.")
+            if not hasattr(env_paths, 'subjects_train') or not env_paths.subjects_train:
+                raise ValueError("env_paths.subjects_train is not defined or is empty. Please set it for CafcaLamDataset.")
+            subject_id = self.cfg.get('cafca_subject_id_for_single_infer', None)
+            self.cafca_dataset = CafcaDataset(subject_list=eval_subjects, mode="lam_infer")
+            self.cafca_loader = torch.utils.data.DataLoader(
+                self.cafca_dataset, batch_size=1, shuffle=False, num_workers=2  # Batch size 1 for inference
+            )
+
+    def _build_model(self, cfg):
+        """
+        from lam.models import model_dict
+        hf_model_cls = wrap_model_hub(model_dict[self.EXP_TYPE])
+        model = hf_model_cls.from_pretrained(cfg.model_name)
+        """
+        from lam.models import ModelLAM
+        model = ModelLAM(**cfg.model)
+
+        resume = os.path.join(cfg.model_name, "model.safetensors")
+        print("==="*16*3)
+        print("loading pretrained weight from:", resume)
+        if resume.endswith('safetensors'):
+            ckpt = load_file(resume, device='cpu')
+        else:
+            ckpt = torch.load(resume, map_location='cpu')
+        state_dict = model.state_dict()
+        for k, v in ckpt.items():
+            if k in state_dict:
+                if state_dict[k].shape == v.shape:
+                    state_dict[k].copy_(v)
+                else:
+                    print(f"WARN] mismatching shape for param {k}: ckpt {v.shape} != model {state_dict[k].shape}, ignored.")
+            else:
+                print(f"WARN] unexpected param {k}: {v.shape}")
+        print("finish loading pretrained weight from:", resume)
+        print("==="*16*3)
+        return model
+
+    
+    def infer_single(self,
+                        image_path: str,
+                        mask_path_for_preprocess: str,
+                        target_intrinsics: np.ndarray,
+                        canonical_flame_path_for_subject: str,
+                        world2cam: np.ndarray,
+                        dump_image_dir: str,
+                        dump_video_path: str,
+                        driving_image_path: str,
+                        export_video: bool):
+            # preprocess source
+            source_size = self.cfg.source_size
+            ref_bg = 1.0
+            effective_mask = mask_path_for_preprocess if os.path.exists(mask_path_for_preprocess) else None
+            image, _, _, _, shape_param = preprocess_image(
+                image_path,
+                mask_path=effective_mask,
+                intr=None,
+                pad_ratio=0,
+                bg_color=ref_bg,
+                max_tgt_size=None,
+                aspect_standard=1.0,
+                enlarge_ratio=[1.0,1.0],
+                render_tgt_size=source_size,
+                multiply=14,
+                need_mask=True,
+                get_shape_param=True,
+                canonical_flame_path_override=canonical_flame_path_for_subject
+            )
+            # setup render transforms
+            render_w2c = torch.from_numpy(world2cam).float().unsqueeze(0).unsqueeze(1)
+            render_intrs= torch.from_numpy(target_intrinsics).float().unsqueeze(0).unsqueeze(1)
+            bg_colors = torch.ones((1,1,3),dtype=torch.float32)
+            flame_params = load_flame_params(canonical_flame_path_for_subject)
+            flame_params['betas'] = shape_param.unsqueeze(0)
+            for k in ['expr','rotation','neck_pose','jaw_pose','eyes_pose','translation']:
+                if k in flame_params:
+                    flame_params[k] = flame_params[k].unsqueeze(0).unsqueeze(0)
+            # inference
+            device = 'cuda'
+            dtype = torch.float32
+            self.model.to(dtype)
+            with torch.no_grad():
+                res = self.model.infer_single_view(
+                    image.unsqueeze(0).to(device,dtype),
+                    None, None,
+                    render_w2cs=render_w2c.to(device),
+                    render_intrs=render_intrs.to(device),
+                    render_bg_colors=bg_colors.to(device),
+                    flame_params={k:v.to(device) for k,v in flame_params.items()}
+                )
+            # save video if requested
+            if export_video:
+                self.model.save_video(
+                    dump_video_path,
+                    image.unsqueeze(0).to(device,dtype),
+                    flame_params={k:v.to(device) for k,v in flame_params.items()},
+                    intrinsics=render_intrs.to(device),
+                    render_bg_color=bg_colors.to(device)
+                )
+            rgb = res['comp_rgb'].detach().cpu().numpy()
+            rgb = (np.clip(rgb,0,1)*255).astype(np.uint8)
+            only_pred = rgb
+            if dump_image_dir is not None:
+                for i in range(rgb.shape[0]):
+                    save_file = os.path.join(dump_image_dir, f"{i:04d}.png")
+                    Image.fromarray(only_pred[i]).save(save_file)
+                    res["3dgs"][i][0][0].save_ply(os.path.join(dump_image_dir, f"{i:04d}.ply"))
+
+            if not self.cfg.save_img or not dump_image_dir:
+                return
+
+            # 1) ensure subject dir exists
+            os.makedirs(dump_image_dir, exist_ok=True)
+            print(f"Saving images to {dump_image_dir}")
+
+            # 2) extract camera IDs from filenames
+            src_cam = Path(image_path).stem             # e.g. "C00"
+            drv_cam = Path(driving_image_path).stem     # e.g. "C04"
+
+            # 3) make ONE subfolder per source
+            src_dir = os.path.join(dump_image_dir, src_cam)
+            os.makedirs(src_dir, exist_ok=True)
+
+            # 4) save every rendered view
+            for vidx in range(rgb.shape[0]):
+                fname = f"{src_cam}_to_{drv_cam}_{vidx:04d}.png"
+                out_pth = os.path.join(src_dir, fname)
+                Image.fromarray(rgb[vidx]).save(out_pth)
+
+            # 5) composite just the first rendered view
+            first_pth = os.path.join(src_dir, f"{src_cam}_to_{drv_cam}_0000.png")
+            if os.path.isfile(first_pth):
+                pred_im = Image.open(first_pth)
+                W, H    = pred_im.size
+
+                src_im = Image.open(image_path).resize((W, H))
+                drv_im = Image.open(driving_image_path).resize((W, H))
+
+                comp = Image.new("RGB", (W * 3, H))
+                comp.paste(src_im, (0,   0))
+                comp.paste(drv_im, (W,   0))
+                comp.paste(pred_im, (2*W, 0))
+                comp.save(first_pth)
+            else:
+                logger.warning(f"Could not composite, missing {first_pth}")
+            preds = res['comp_rgb']       # Tensor[Nv, H, W, 3], CPU or CUDA
+            gt_pil = Image.open(driving_image_path).convert("RGB").resize((preds.shape[2], preds.shape[1]))
+            gt_np  = np.array(gt_pil).astype(np.float32) / 255.0
+            gt_t   = torch.from_numpy(gt_np).permute(2,0,1).unsqueeze(0).to(preds.device)
+
+            metrics = []
+            for vidx in range(preds.shape[0]):
+                p = preds[vidx]                 # [H,W,3]
+                p = p.permute(2,0,1).unsqueeze(0)  # → [1,3,H,W]
+                l1    = self.l1_loss_fn   (p, gt_t).item()
+                lpips = self.lpips_loss_fn(p, gt_t).item()
+                psnr  = self.psnr_metric  (p, gt_t).item()
+                ssim  = self.ssim_metric  (p, gt_t).item()
+                metrics.append((vidx, l1, lpips, psnr, ssim))
+
+            return metrics
+
+    def infer(self):
+        if self.cfg.get('use_cafca_dataset', False):
+            target_sid = int(self.cfg.cafca_subject_id_for_single_infer)
+            # all frames for that subject
+            data     = [d for d in self.cafca_dataset.data if d['subject_id_int'] == target_sid]
+            # only those marked as valid sources
+            sources  = [d for d in data if d.get('is_source_candidate')]
+            drivings = data
+
+        for src in tqdm(sources, desc=f"Subject {target_sid} sources"):
+            src_cam = src['cam_id']
+            is_first = True
+            # prepare per-source output dir & CSV path
+            img_subdir = os.path.join(self.cfg.image_dump, str(target_sid), src_cam)
+            os.makedirs(img_subdir, exist_ok=True)
+            csv_path = os.path.join(img_subdir, "metrics.csv")
+
+            # collect metrics for this source cam
+            per_src_metrics = []
+
+            # ensure video dir exists once
+            vid_dir = os.path.join(self.cfg.video_dump, str(target_sid))
+            os.makedirs(vid_dir, exist_ok=True)
+
+            for drv in drivings:
+                drv_cam = drv['cam_id']
+                pair = f"{src_cam}_to_{drv_cam}"
+                vid_path = os.path.join(vid_dir, f"{pair}.mp4")
+
+                # run inference & get per-view metrics
+                metrics = self.infer_single(
+                    image_path=src['image_file_path'],
+                    driving_image_path=drv['image_file_path'],
+                    mask_path_for_preprocess=src['mask_file_path'],
+                    target_intrinsics=drv['intrinsic'],
+                    canonical_flame_path_for_subject=src['canonical_flame_param_path'],
+                    world2cam=drv['world_2_cam'],
+                    dump_image_dir=img_subdir,
+                    dump_video_path=vid_path,
+                    export_video=is_first
+                )
+                is_first = False
+
+                # metrics is a list of (view_idx, l1, lpips, psnr, ssim)
+                # prefix each row with the driving cam
+                for vidx, l1, lpips, psnr, ssim in metrics:
+                    per_src_metrics.append((drv_cam, vidx, l1, lpips, psnr, ssim))
+
+            # now write **one** CSV for this source cam
+            # columns: driving_cam, view_idx, l1, lpips, psnr, ssim
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['driving_cam','view_idx','l1','lpips','psnr','ssim'])
+
+                # write all rows
+                for row in per_src_metrics:
+                    writer.writerow(row)
+
+                # compute averages
+                if per_src_metrics:
+                    # convert to numpy for easy averaging
+                    import numpy as np
+                    arr = np.array([r[2:] for r in per_src_metrics], dtype=np.float32)
+                    avg = arr.mean(axis=0)
+                    writer.writerow([])
+                    writer.writerow(['AVERAGE', '', *avg.tolist()])
+
+            print(f"→ metrics for source {src_cam} written to {csv_path}")

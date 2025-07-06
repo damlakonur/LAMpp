@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-import time
+import torch.nn.functional as F
 import math
 from collections import defaultdict
 import numpy as np
@@ -60,6 +60,7 @@ class ModelLAM(nn.Module):
                  expr_param_dim=50,
                  fix_opacity=False,
                  fix_rotation=False,
+                 num_source_views=1,
                  flame_scale=1.0,
                  instantiate_encoder=True,
                  instantiate_transformer=True,
@@ -75,6 +76,8 @@ class ModelLAM(nn.Module):
         self.conf_cat_feat = False and self.conf_use_pred_img  # True # False
         self.instantiate_encoder = instantiate_encoder
         self.instantiate_transformer = instantiate_transformer
+        self.num_source_views = num_source_views
+        self.flame_scale = flame_scale
 
         # modules
         # image encoder
@@ -115,6 +118,22 @@ class ModelLAM(nn.Module):
             )
         else:
             self.transformer = None
+            
+        # To fuse information from n-views
+        if self.num_source_views > 1:
+            # initialzie it with zeros
+            # self.fusion_layer = nn.Linear(transformer_dim * self.num_source_views, transformer_dim)
+            
+            hidden_dim = transformer_dim // 4  
+            self.view_weighting = nn.Sequential(
+                nn.Linear(transformer_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1)  # scalar weight per point per view
+            )
+            self.fusion_layer = nn.Linear(transformer_dim, transformer_dim)
+            nn.init.zeros_(self.fusion_layer.weight)
+            nn.init.zeros_(self.fusion_layer.bias)
+            self.layer_norm = nn.LayerNorm(transformer_dim)
         
         # renderer
         self.renderer = GS3DRenderer(human_model_path=human_model_path,
@@ -154,6 +173,7 @@ class ModelLAM(nn.Module):
         # assert image_feats.shape[0] == camera_embeddings.shape[0], \
         #     "Batch size mismatch for image_feats and camera_embeddings!"
         B = image_feats.shape[0]
+        # Attaches learnable features to the flame vertices to use in cross attention
         if self.latent_query_points_type == "embedding":
             range_ = torch.arange(self.num_pcl, device=image_feats.device)
             x =  self.pcl_embeddings(range_).unsqueeze(0).repeat((B, 1, 1)) # [B, L, D]
@@ -224,11 +244,30 @@ class ModelLAM(nn.Module):
         render_h, render_w = 512, 512
         query_points = None
         if latent_points.ndim >= 3:
-            n_src = latent_points.size(1)
-            if n_src == 2:
-                latent_points = latent_points.mean(dim=1, keepdim=False)
+            # if n_src == 2:
+            #     latent_points = latent_points.mean(dim=1, keepdim=False)
+            if hasattr(self, 'fusion_layer') and self.num_source_views > 1:
+                # first average it 
+                B, V, N, D = latent_points.shape
+                avg_points = latent_points.mean(dim=1, keepdim=False)
+                
+                # latent_points = latent_points.permute(0, 2, 1, 3).reshape(latent_points.size(0), latent_points.size(2), -1)
+                # latent_points = latent_points.float() 
+                # latent_points = self.fusion_layer(latent_points)
+                # latent_points += avg_points
+                
+                # latent_points shape: [B, num_views=2, num_points=N, dim=D]
+                weights = self.view_weighting(latent_points) # [B, 2, N, 1]
+                weights = F.softmax(weights, dim=1) # softmax across views per-point
 
-            elif n_src == 1:
+                # Weighted aggregation: [B, N, D]
+                aggregated_points = (latent_points * weights).sum(dim=1)
+                latent_points = self.fusion_layer(aggregated_points) + avg_points
+                latent_points = self.layer_norm(latent_points)
+                
+
+
+            elif self.num_source_views == 1:
                 latent_points = latent_points.squeeze(1)
 
         if self.latent_query_points_type.startswith("e2e_flame"):
@@ -255,7 +294,7 @@ class ModelLAM(nn.Module):
         }
         
     @torch.no_grad()
-    def infer_single_view(self, image, source_c2ws, source_intrs, render_c2ws, 
+    def infer_single_view(self, image, source_c2ws, source_intrs, render_w2cs, 
                           render_intrs, render_bg_colors, flame_params):
         # image: [B, N_ref, C_img, H_img, W_img]
         # source_c2ws: [B, N_ref, 4, 4]
@@ -264,7 +303,7 @@ class ModelLAM(nn.Module):
         # render_intrs: [B, N_source, 4, 4]
         # render_bg_colors: [B, N_source, 3]
         # flame_params: Dict, e.g., pose_shape: [B, N_source, 21, 3], betas:[B, 100]
-        assert image.shape[0] == render_c2ws.shape[0], "Batch size mismatch for image and render_c2ws"
+        assert image.shape[0] == render_w2cs.shape[0], "Batch size mismatch for image and render_c2ws"
         assert image.shape[0] == render_bg_colors.shape[0], "Batch size mismatch for image and render_bg_colors"
         assert image.shape[0] == flame_params["betas"].shape[0], "Batch size mismatch for image and flame_params"
         assert image.shape[0] == flame_params["expr"].shape[0], "Batch size mismatch for image and flame_params"
@@ -272,12 +311,13 @@ class ModelLAM(nn.Module):
         # render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(render_intrs[0, 0, 0, 2] * 2)
         render_h, render_w = 512, 512  # for testing
         assert image.shape[0] == 1
-        num_views = render_c2ws.shape[1]
+        num_views = render_w2cs.shape[1]
         query_points = None
         
         if self.latent_query_points_type.startswith("e2e_flame"):
             query_points, flame_params = self.renderer.get_query_points(flame_params,
                                                                         device=image.device)
+        breakpoint()
         latent_points, image_feats = self.forward_latent_points(image[:, 0], camera=None, query_points=query_points)  # [B, N, C]
         image_feats_bchw = rearrange(image_feats, "b (h w) c -> b c h w", h=int(math.sqrt(image_feats.shape[1])))
 
@@ -292,7 +332,7 @@ class ModelLAM(nn.Module):
             render_res = self.renderer.forward_animate_gs(gs_model_list, 
                                                           query_points,
                                                           self.renderer.get_single_view_smpl_data(flame_params, view_idx), 
-                                                          render_c2ws[:, view_idx:view_idx+1], 
+                                                          render_w2cs[:, view_idx:view_idx+1], 
                                                           render_intrs[:, view_idx:view_idx+1], 
                                                           render_h, 
                                                           render_w, 
@@ -314,7 +354,7 @@ class ModelLAM(nn.Module):
         out['cano_gs_lst'] = gs_model_list
         return out
 
-    def save_video(self, video_path, image, flame_params, intrinsics, render_bg_color, fps=8, seconds=4, resolution=(512, 512)):
+    def save_video(self, video_path, image, flame_params, intrinsics, render_bg_color, fps=1, seconds=4, resolution=(512, 512)):
         from tqdm import tqdm
 
         os.makedirs(os.path.dirname(video_path), exist_ok=True)
@@ -331,14 +371,14 @@ class ModelLAM(nn.Module):
         )
         trajectory3 = circle_around_axis(
             total_frames,
-            axis=Vec3(0, 0, 1),
+            axis=Vec3(0, 1, 0),    # orbiting around Y axis (horizontal)
             up=Vec3(0, 1, 0),
-            move=Vec3(1, 0, 0),
+            move=Vec3(0, 0, -1),   # start behind the head
             distance=0.3,
         )
 
-        render_c2ws = torch.stack(
-            [torch.from_numpy(p).float() for p in trajectory  + trajectory3], dim=0
+        render_w2cs = torch.stack(
+            [torch.from_numpy(np.linalg.inv(p)).float() for p in trajectory + trajectory3], dim=0
         ).unsqueeze(0).to(image.device)
 
         with VideoWriter(video_path, (W, H), fps=fps) as writer:
@@ -347,7 +387,7 @@ class ModelLAM(nn.Module):
                     image=image,
                     source_c2ws=None,
                     source_intrs=None,
-                    render_c2ws=render_c2ws[:, i:i+1],
+                    render_w2cs=render_w2cs[:, i:i+1],
                     render_intrs=intrinsics,
                     render_bg_colors=render_bg_color,
                     flame_params=flame_params,

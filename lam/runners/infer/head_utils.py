@@ -122,6 +122,8 @@ def preprocess_image(rgb_path, mask_path, intr, pad_ratio, bg_color,
                             get_shape_param=False, canonical_flame_path_override=None):
     rgb = np.array(Image.open(rgb_path))
     rgb_raw = rgb.copy()
+    rgb_raw = rgb_raw / 255.0
+    
     if pad_ratio > 0:
         rgb = img_center_padding(rgb, pad_ratio)
 
@@ -188,7 +190,7 @@ def preprocess_image(rgb_path, mask_path, intr, pad_ratio, bg_color,
         flame_p = np.load(flame_p_file_to_load)
         shape_param = torch.FloatTensor(flame_p['shape'])
 
-    return rgb, mask, intr, shape_param
+    return rgb, rgb_raw, mask, intr, shape_param
 
 
 def extract_imgs_from_video(video_file, save_root, fps):
@@ -222,39 +224,45 @@ def predict_motion_seqs_from_images(image_folder:str, save_root, fps=6):
     return save_flame_root, image_folder
 
 
-def render_flame_mesh(data, render_intrs, c2ws, human_model_path="./pretrained_models/human_model_files"):
+def render_flame_mesh(data, render_intrs, w2cs, human_model_path="./model_zoo/human_parametric_models"):
     from lam.models.rendering.flame_model.flame import FlameHead, FlameHeadSubdivided
     from lam.models.rendering.utils.vis_utils import render_mesh
 
-    subdivide = 2
+    subdivide = 1
     flame_sub_model = FlameHeadSubdivided(
         300,
         100,
         add_teeth=True,
         add_shoulder=False,
-        flame_model_path='pretrained_models/human_model_files/flame_assets/flame/flame2023.pkl',
-        flame_lmk_embedding_path="pretrained_models/human_model_files/flame_assets/flame/landmark_embedding_with_eyes.npy",
-        flame_template_mesh_path="pretrained_models/human_model_files/flame_assets/flame/head_template_mesh.obj",
-        flame_parts_path="pretrained_models/human_model_files/flame_assets/flame/FLAME_masks.pkl",
+        flame_model_path='model_zoo/human_parametric_models/flame_assets/flame/flame2023.pkl',
+        flame_lmk_embedding_path="model_zoo/human_parametric_models/flame_assets/flame/landmark_embedding_with_eyes.npy",
+        flame_template_mesh_path="model_zoo/human_parametric_models/flame_assets/flame/head_template_mesh.obj",
+        flame_parts_path="model_zoo/human_parametric_models/flame_assets/flame/FLAME_masks.pkl",
         subdivide_num=subdivide
     ).cuda()
 
-    shape = data['shape'].to('cuda')
+    shape = data['betas'].to('cuda')
     flame_param = {}
-    flame_param['expr'] = data['expr'].to('cuda')
-    flame_param['rotation'] = data['rotation'].to('cuda')
-    flame_param['neck'] = data['neck_pose'].to('cuda')
-    flame_param['jaw'] = data['jaw_pose'].to('cuda')
-    flame_param['eyes'] = data['eyes_pose'].to('cuda')
-    flame_param['translation'] = data['translation'].to('cuda')
+    def _prepare_param(p):
+        p_tensor = p.to('cuda')
+        if p_tensor.ndim == 3 and p_tensor.shape[1] == 1:
+            return p_tensor.squeeze(1)
+        return p_tensor
+
+    flame_param['expr'] = _prepare_param(data['expr'])
+    flame_param['rotation'] = _prepare_param(data['rotation'])
+    flame_param['neck'] = _prepare_param(data['neck_pose'])
+    flame_param['jaw'] = _prepare_param(data['jaw_pose'])
+    flame_param['eyes'] = _prepare_param(data['eyes_pose'])
+    flame_param['translation'] = _prepare_param(data['translation'])
     
     v_cano = flame_sub_model.get_cano_verts(
-        shape.unsqueeze(0)
+        shape
     )
 
     ret = flame_sub_model.animation_forward(
         v_cano.repeat(flame_param['expr'].shape[0], 1, 1),
-        shape.unsqueeze(0).repeat(flame_param['expr'].shape[0], 1),
+        shape.repeat(flame_param['expr'].shape[0], 1),
         flame_param['expr'],
         flame_param['rotation'],
         flame_param['neck'],
@@ -272,18 +280,21 @@ def render_flame_mesh(data, render_intrs, c2ws, human_model_path="./pretrained_m
     mesh_render_list = []
     num_view = flame_param['expr'].shape[0]
     for v_idx in range(num_view):
-        intr = render_intrs[v_idx]
+        intr = render_intrs[v_idx].squeeze()
         cam_param = {"focal": torch.tensor([intr[0, 0], intr[1, 1]]), 
                     "princpt": torch.tensor([intr[0, 2], intr[1, 2]])}
-        render_shape = int(cam_param['princpt'][1]* 2), int(cam_param['princpt'][0] * 2)     # require h, w
+        render_shape = 512, 512   # require h, w
 
         vertices = ret["animated"][v_idx].cpu().squeeze()
 
-        c2w = c2ws[v_idx]
-        w2c = torch.inverse(c2w)
+        w2c = w2cs[v_idx]
         R = w2c[:3, :3]
         T = w2c[:3, 3]
         vertices = vertices @ R + T
+        if vertices.shape[-1] == 4:
+            vertices = vertices[..., :3] / vertices[..., 3:].clamp(min=1e-6)
+        vertices = vertices.view(-1, 3)
+        print("vertices shape before render_mesh:", vertices.shape)
 
         mesh_render, is_bkg = render_mesh(vertices,
                                 flame_face, cam_param,
@@ -363,7 +374,6 @@ def prepare_motion_seqs(motion_seqs_dir, image_folder, save_root, fps,
         teeth_bs_lst = np.load(teeth_bs_pth)['expr_teeth']
     else:
         teeth_bs_lst = None
-
     for idx, frame_id in enumerate(frame_ids):
         frame_info = all_frames[frame_id]
         flame_path = os.path.join(os.path.dirname(motion_seqs_dir), frame_info["flame_param_path"])
@@ -384,7 +394,6 @@ def prepare_motion_seqs(motion_seqs_dir, image_folder, save_root, fps,
         bg_colors.append(bg_color)
         intrs.append(intrinsic)
         flame_params.append(flame_param)
-
     c2ws = torch.stack(c2ws, dim=0)  # [N, 4, 4]
     intrs = torch.stack(intrs, dim=0)  # [N, 4, 4]
     bg_colors = torch.tensor(bg_colors, dtype=torch.float32).unsqueeze(-1).repeat(1, 3)  # [N, 3]

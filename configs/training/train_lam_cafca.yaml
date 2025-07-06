@@ -1,7 +1,8 @@
 experiment:
   name: "lam_1view_overfitting"
-  output_dir: "./exps/finetuned_lam_cafca_renderer_mlp"
+  output_dir: "./exps/finetuned_lam_cafca_full_weighted_fusion"
   model_name: "exps/releases/lam/lam-20k/step_045500/"
+  checkpoint: "/home/dkonur/LAMpp/exps/finetuned_lam_cafca_full_fused_average/lam_1view_overfitting/checkpoints/epoch=0139-val/total_loss=0.2614.ckpt"
 
 model:
   pretrained_model_name_or_path: "/home/dkonur/LAMpp/exps/releases/lam/lam-20k/step_045500/"
@@ -50,28 +51,43 @@ model:
   render_rgb: true
   decode_with_extra_info: null
   scale_sphere: false
+  num_source_views: 2
 
 dataset:
-  cafca_subject_ids_train: [30, 31, 32, 33] #, 34, 35, 36, 41, 45
-  cafca_subject_ids_val: [55, 49] #, 50, 51,  48
-  num_of_src_views: 1
-  num_of_target_views: 4 # try 2-3 and increase batch size
-  max_tokens_in_ram: 64
+  # cafca_subject_ids_train: [30, 31, 32, 33, 34, 35, 36, 41, 45] #, 34, 35, 36, 41, 45
+# 124, 171, 159, 77, 116, 107, 225, 256, 295, 12
+  cafca_subject_ids_train: [
+    1, 2, 10, 14, 19, 20, 21, 23, 24, 26,
+    39, 44, 54, 56, 57, 59, 60, 63, 64, 65, 66,
+    68, 70, 72, 73, 74, 75, 78, 80, 81, 82, 83, 84, 86, 87, 89, 94, 95,
+    96, 98, 99, 100, 102, 103, 104, 108, 109, 111, 114, 119, 120,
+    129, 132, 133, 138, 139, 147, 148, 151, 152, 153, 154, 157,
+    160, 161, 162, 165, 166, 167, 170, 178, 179, 181, 182, 183, 186,
+    190, 194, 195, 201, 204, 205, 206, 208, 211, 212, 213, 215, 218, 219,
+    220, 221, 224, 227, 228, 230, 232, 233, 234, 235, 236, 238, 239,
+    240, 241, 243, 244, 246, 247, 248, 251, 252, 254, 255, 257, 259,
+    260, 261, 264, 266, 267, 272, 274, 275, 277, 281, 283, 285, 286, 290,
+    291, 293, 294, 296, 297, 298
+  ]
+  cafca_subject_ids_val: [30, 31, 32, 33, 34, 35, 36, 41, 45, 50, 51, 55] #12 -> 48, 49
+  max_tokens_in_ram: 16
+  num_of_src_views: 2
+  num_of_target_views: 4 
 
 training:
   batch_size: 8
-  num_epochs: 100
+  num_epochs: 200
   learning_rate: 1e-5
   device: "cuda"
-  save_every_n_epochs: 20
+  save_every_n_epochs: 10
   image_size: 512
-  num_workers: 2
+  num_workers: 6
   l1_loss_weight: 1.0
   lpips_loss_weight: 1.0
   silhouette_loss_weight: 1.0
   offset_loss_weight: 0.1
   finetune_renderer_mlp_only: True
-  validate_every_n_epochs: 1
+  validate_every_n_epochs: 5
   num_val_samples_to_log: 1
   num_train_samples_to_log: 1
 
@@ -80,9 +96,9 @@ wandb:
   enabled: true
   project: "lam-1-view-finetuning"
   entity: "gr-lampp"
-  run_name: "1-view_overfitting_b8_2workers_alex_wo_gs_net"
-  log_every_n_steps: 10
-  log_train_images_every_n_steps: 15
+  run_name: "2-view_136_subjects_full_weighted_fusion"
+  log_every_n_steps: 20
+  log_train_images_every_n_steps: 10
 
 profiler:
   is_enabled: false

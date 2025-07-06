@@ -36,8 +36,8 @@ def images_to_video(images, output_path, fps, gradio_codec: bool, verbose=False)
     if gradio_codec:
         imageio.mimwrite(output_path, frames, fps=fps, quality=10)
     else:
-        # imageio.mimwrite(output_path, frames, fps=fps, codec='mpeg4', quality=10)
-        imageio.mimwrite(output_path, frames, fps=fps, quality=10)
+        imageio.mimwrite(output_path, frames, fps=fps, codec='mpeg4', quality=10)
+        # imageio.mimwrite(output_path, frames, fps=fps, quality=10)
 
     if verbose:
         print(f"Using gradio codec option {gradio_codec}")

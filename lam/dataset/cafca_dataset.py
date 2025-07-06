@@ -37,19 +37,26 @@ class CafcaDataset(Dataset):
             masked_images_dir = subject_base_dir / "masked_images"
             masks_dir = subject_base_dir / "foreground_mask"
             cameras_dir = subject_base_dir / "cameras_json"
+            source_json_path = self.root_dir / "available_source_views.json"
+            with open(source_json_path, "r") as f:
+                raw = json.load(f)
+            self.allowed_source_cams = {
+                int(entry["subject_id"]): set(entry["cameras_with_non_zero_lmks"])
+                for entry in raw
+            }
 
             if not flame_params_path.exists():
                 print(f"Warning: Canonical FLAME param file not found for subject {subject_str_zfill} at {flame_params_path}. Skipping subject.")
                 continue
 
             if not masked_images_dir.exists():
-                print(f"Warning: Preprocessed images directory not found for subject {subject_str_zfill} at {masked_images_dir}. Skipping subject.")
+                print(f"Warning: Images directory not found for subject {subject_str_zfill} at {masked_images_dir}. Skipping subject.")
                 continue
 
             camera_files = sorted(list(cameras_dir.glob("*.json")))
 
             if not camera_files:
-                print(f"Warning: No preprocessed camera files found for subject {subject_str_zfill} in {cameras_dir}. Skipping subject.")
+                print(f"Warning: No camera files found for subject {subject_str_zfill} in {cameras_dir}. Skipping subject.")
                 continue
 
             for cam_json_file in camera_files:
@@ -59,10 +66,10 @@ class CafcaDataset(Dataset):
                 mask_file = masks_dir / f"{cam_id}.png"
 
                 if not image_file.exists():
-                    print(f"Warning: Preprocessed image {image_file} not found for subject {subject_str_zfill}, cam {cam_id}. Skipping item.")
+                    print(f"Warning: Image {image_file} not found for subject {subject_str_zfill}, cam {cam_id}. Skipping item.")
                     continue
                 if not mask_file.exists():
-                    print(f"Warning: Preprocessed mask {mask_file} not found for subject {subject_str_zfill}, cam {cam_id}. Skipping item.")
+                    print(f"Warning: Mask {mask_file} not found for subject {subject_str_zfill}, cam {cam_id}. Skipping item.")
                     continue
 
                 try:
@@ -77,11 +84,12 @@ class CafcaDataset(Dataset):
                             "subject_id_int": subject_int,
                             "subject_id_str": subject_str_zfill,
                             "cam_id": cam_id,
-                            "image_file_path": str(image_file),  # Path to 512x512 preprocessed image
-                            "mask_file_path": str(mask_file),    # Path to 512x512 preprocessed mask
-                            "intrinsic": np.array(cam_params["K"]), # Original intrinsics for 512x512 image
+                            "image_file_path": str(image_file),
+                            "mask_file_path": str(mask_file),
+                            "intrinsic": np.array(cam_params["K"]),
                             "canonical_flame_param_path": str(flame_params_path),
-                            "cam_2_world": np.array(cam_params["cam2world"]), # Camera to canonical flame transformation
+                            "world_2_cam": np.array(cam_params["world2cam"]),
+                            "is_source_candidate": cam_id in self.allowed_source_cams.get(subject_int, set()),
                         }
                     )
                 except Exception as e:
@@ -103,7 +111,7 @@ class CafcaDataset(Dataset):
 
 if __name__ == '__main__':
     if hasattr(env_paths, 'subjects_train') and env_paths.subjects_train:
-        dataset = CafcaLamDataset(subject_list=env_paths.subjects_train)
+        dataset = CafcaDataset(subject_list=env_paths.subjects_train)
         print(f"Loaded {len(dataset)} items for LAM inference.")
         if len(dataset) > 0:
             print("First item:", dataset[0])

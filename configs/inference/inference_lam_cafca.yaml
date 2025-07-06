@@ -1,0 +1,35 @@
+experiment:
+  output_dir: "./exps/inference_finetuned2"
+  checkpoint: "./exps/finetuned_lam_cafca_full_fused_average/lam_1view_overfitting/checkpoints/epoch=0139-val/total_loss=0.2614.ckpt"
+  motion_seqs_dir: "assets/sample_motion/export/Pen_Pineapple_Apple_Pen/"
+  subj_id: 32
+  source_cam_ids: ["C08", "C15"]
+model:
+  pretrained_model_name_or_path: "exps/releases/lam/lam-20k/step_045500/"
+  transformer_dim: 1024
+  transformer_layers: 10
+  transformer_heads: 16
+  latent_query_points_type: "e2e_flame"
+  encoder_type: "dinov2_fusion"
+  encoder_model_name: "dinov2_vitl14_reg"
+  encoder_feat_dim: 1024
+  gs_query_dim: 1024
+  gs_use_rgb: true
+  gs_sh: 3
+  gs_mlp_network_config:
+    activation: "silu"
+    n_hidden_layers: 2
+    n_neurons: 512
+  shape_param_dim: 10
+  expr_param_dim: 10
+  num_source_views: 2          # keep for ModelLAM construction
+
+dataset:
+  cafca_subject_ids_val: [32] # 30, 31, 32, 33, 34, 35, 36, 41, 45, 50, 51, 55
+  max_tokens_in_ram: 16
+  num_of_src_views: 2
+  num_of_target_views: 1
+
+training:                      # only fields still referenced in code
+  image_size: 512
+  finetune_renderer_mlp_only: false

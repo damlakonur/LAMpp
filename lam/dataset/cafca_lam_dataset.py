@@ -68,7 +68,6 @@ class CafcaLamDataset(Dataset):
             cameras_dir = subject_base_dir / "cameras_json"
             masks_dir = subject_base_dir / "foreground_mask"
             tokens_dir = subject_base_dir / "tokens"
-            img_feats_dir = subject_base_dir / "image_feats"
 
             if not flame_params_path.exists():
                 print(f"FLAME param file not found for subject {subject_str_zfill} at {flame_params_path}. Skipping subject.")
@@ -84,10 +83,6 @@ class CafcaLamDataset(Dataset):
             
             if not tokens_dir.exists():
                 print(f"Tokens directory not found for subject {subject_str_zfill} at {tokens_dir}. Skipping subject.")
-                continue
-            
-            if not img_feats_dir.exists():
-                print(f"Image features directory not found for subject {subject_str_zfill} at {img_feats_dir}. Skipping subject.")
                 continue
 
             camera_files = sorted(list(cameras_dir.glob("*.json")))
@@ -155,9 +150,9 @@ class CafcaLamDataset(Dataset):
         cache = self._token_cache
         if path in cache:
             cache.move_to_end(path)
-            print(f"Cache hit ##############.")
+            # print(f"Cache hit ##############.")
             return cache[path]
-        print(f"Cache miss ##############. Loading into cache.")
+        # print(f"Cache miss ##############. Loading into cache.")
         npz = np.load(path, mmap_mode='r')
         tensor = torch.from_numpy(npz["tokens"])
 
@@ -253,10 +248,14 @@ class CafcaLamDataset(Dataset):
         for s_idx in source_frame_indices:
             meta = subject_frames_info[s_idx]
             source_images_list.append(self._load_image_as_tensor(meta["image_file_path"]))
+            npz_token = np.load(meta["token_file_path"])
             # npz_token = np.load(meta["token_file_path"], mmap_mode='r')
             # source_img_tokens_list.append(torch.from_numpy(npz_token["tokens"]))
-            source_img_tokens_list.append(self._get_token_tensor(meta["token_file_path"]))
+
+            source_img_tokens_list.append(torch.from_numpy(npz_token["tokens"]))
+            # source_img_tokens_list.append(self._get_token_tensor(meta["token_file_path"]))
             # source_img_tokens_list.append(torch.zeros((20018, 1024), dtype=torch.float16))
+
             source_cam_ids_list.append(meta["cam_id"])
 
         driving_images_list, driving_w2cs_list, driving_intrs_list, driving_cam_ids_list, driving_mask_list = [], [], [], [], []
@@ -295,6 +294,50 @@ class CafcaLamDataset(Dataset):
                         if driving_images_list else torch.empty(0, *v_tensor.shape))
 
         return out_item
+    
+    def get_item_by_cam_ids(self, subject_id: int, source_cam_ids: list[str]):
+        """
+        Return one inference item by manually specifying source cam IDs.
+        Only loads source data. Driving data will be overridden later.
+        """
+        subject_frames_info = self.subject_data[subject_id]
+        candidates = self.source_candidates[subject_id]
+
+        # map cam ids to frame indices
+        cam_id_to_idx = {frame_info["cam_id"]: idx for idx, frame_info in enumerate(subject_frames_info)}
+        source_frame_indices = [cam_id_to_idx[cid] for cid in source_cam_ids if cid in cam_id_to_idx]
+
+        subject_flame_params = self._load_subject_flame_params(
+            subject_frames_info[source_frame_indices[0]]['subject_flame_param_path']
+        )
+
+        source_images_list, source_cam_ids_list, source_img_tokens_list = [], [], []
+        for s_idx in source_frame_indices:
+            meta = subject_frames_info[s_idx]
+            source_images_list.append(self._load_image_as_tensor(meta["image_file_path"]))
+            npz_token = np.load(meta["token_file_path"])
+            source_img_tokens_list.append(torch.from_numpy(npz_token["tokens"]))
+            source_cam_ids_list.append(meta["cam_id"])
+
+        out_item = {
+            "source_rgbs": torch.stack(source_images_list).unsqueeze(0),
+            "tokens": torch.stack(source_img_tokens_list).unsqueeze(0),
+            "driving_image": torch.empty(1, 0),
+            "driving_w2cs": torch.empty(1, 0),
+            "driving_intrs": torch.empty(1, 0),
+            "driving_masks": torch.empty(1, 0),
+            "render_bg_colors": torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32),
+            "uid": f"subj{subject_id}_src{''.join(source_cam_ids_list)}",
+            "subject_id_int_scalar": torch.tensor([subject_id]),
+            "source_cam_ids_list_scalar": [source_cam_ids_list],
+        }
+
+        out_item['betas'] = subject_flame_params['betas']
+        for k, v_tensor in subject_flame_params.items():
+            out_item[k] = v_tensor.unsqueeze(0).repeat(4, 1)  # match __getitem__ format, but leave driving part empty
+
+        return out_item
+    
 
 if __name__ == '__main__':
     if hasattr(env_paths, 'subjects_train') and env_paths.subjects_train:
@@ -315,6 +358,7 @@ if __name__ == '__main__':
                 print(f"Loaded {len(dataset)} items.")
                 if len(dataset) > 0:
                     item = dataset[0]
+                    breakpoint()
                     print("\nExample of a single item returned by __getitem__ (item.keys()):")
                     print(sorted(item.keys()))
 
@@ -325,7 +369,6 @@ if __name__ == '__main__':
                         print(f"  Source c2ws shape: {item['source_c2ws'].shape}")
                         print(f"  Source intrs shape: {item['source_intrs'].shape}")
                         print(f"  Source FLAME betas shape: {item['betas'].shape}")
-                        print(f"img _feats shape: {item['img_feats'].shape}")
                         print(f"tokens shape: {item['tokens'].shape}")
 
                     print(f"Number of driving frames: {item['driving_image'].shape[0] if item['driving_image'].nelement() > 0 else 0}")
