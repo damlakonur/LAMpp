@@ -1,8 +1,8 @@
 experiment:
   name: "lam_1view_overfitting"
-  output_dir: "./exps/finetuned_lam_cafca_full_weighted_fusion"
+  output_dir: "./exps/finetuned_lam_cafca_full_fusion_mlp_plucker"
   model_name: "exps/releases/lam/lam-20k/step_045500/"
-  checkpoint: "/home/dkonur/LAMpp/exps/finetuned_lam_cafca_full_fused_average/lam_1view_overfitting/checkpoints/epoch=0139-val/total_loss=0.2614.ckpt"
+  # checkpoint: "/home/dkonur/LAMpp/exps/finetuned_lam_cafca_full_fused_average/lam_1view_overfitting/checkpoints/epoch=0139-val/total_loss=0.2614.ckpt"
 
 model:
   pretrained_model_name_or_path: "/home/dkonur/LAMpp/exps/releases/lam/lam-20k/step_045500/"
@@ -10,8 +10,8 @@ model:
   transformer_layers: 10
   transformer_heads: 16
   transformer_type: "sd3_cond"
-  tf_grad_ckpt: true
-  encoder_grad_ckpt: true
+  tf_grad_ckpt: false
+  encoder_grad_ckpt: false
   encoder_freeze: false
   encoder_type: 'dinov2_fusion'
   encoder_model_name: 'dinov2_vitl14_reg'
@@ -77,7 +77,7 @@ dataset:
 training:
   batch_size: 8
   num_epochs: 200
-  learning_rate: 1e-5
+  learning_rate: 1e-4
   device: "cuda"
   save_every_n_epochs: 10
   image_size: 512
@@ -96,7 +96,7 @@ wandb:
   enabled: true
   project: "lam-1-view-finetuning"
   entity: "gr-lampp"
-  run_name: "2-view_136_subjects_full_weighted_fusion"
+  run_name: "2-view_136_subjects_fusion_mlp_plucker"
   log_every_n_steps: 20
   log_train_images_every_n_steps: 10
 

@@ -15,6 +15,7 @@
 
 import os
 from dataclasses import dataclass, field
+from lam.models.rendering.utils.mesh_utils import compute_vertex_normals
 from collections import defaultdict
 try:
     from diff_gaussian_rasterization_wda import GaussianRasterizationSettings, GaussianRasterizer
@@ -651,9 +652,10 @@ class GS3DRenderer(nn.Module):
                 # print(flame_data["betas"].shape, flame_data["face_offset"].shape, flame_data["joint_offset"].shape)
                 # positions, _, transform_mat_neutral_pose = self.flame_model.get_query_points(flame_data, device=device)  # [B, N, 3]
                 positions = self.flame_model.get_cano_verts(shape_params=flame_data["betas"])  # [B, N, 3]
+                mesh = Meshes(positions, self.flame_model.faces_up.expand(positions.shape[0], -1, -1))
                 # print(f"positions shape:{positions.shape}")
                 
-        return positions, flame_data
+        return positions, flame_data, mesh.verts_normals_packed().view_as(positions), self.flame_model.faces_up
     
     def query_latent_feat(self,
                           positions: Float[Tensor, "*B N1 3"],

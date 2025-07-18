@@ -309,19 +309,3 @@ class LAMInferrer(Inferrer):
                 export_video               = True,
                 driving_cam_ids=        drv_cams
             )
-        # metrics is list[(view_idx, l1, lpips, psnr, ssim)] length == len(drivings)
-
-        # write one CSV per source
-        # with open(csv_path, 'w', newline='') as f:
-        #     import csv, numpy as np
-        #     writer = csv.writer(f)
-        #     writer.writerow(['driving_cam','view_idx','l1','lpips','psnr','ssim'])
-        #     for (view_idx, l1, lpips, psnr, ssim), drv_cam in zip(metrics, drv_cams):
-        #         writer.writerow([drv_cam, view_idx, l1, lpips, psnr, ssim])
-
-        #     if metrics:
-        #         avg = np.mean(np.array([m[1:] for m in metrics], dtype=np.float32), axis=0)
-        #         writer.writerow([])
-        #         writer.writerow(['AVERAGE','', *avg.tolist()])
-
-        # print(f"→ metrics for source {src_cam} written to {csv_path}")

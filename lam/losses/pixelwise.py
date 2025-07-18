@@ -50,6 +50,10 @@ class PixelLoss(nn.Module):
         Returns:
             Mean-reduced pixel loss across batch.
         """
+        if x.ndim == 4:
+            x = x.unsqueeze(1)  # [B, 1, C, H, W]
+            y = y.unsqueeze(1)
+
         N, M, C, H, W = x.shape
         x = rearrange(x, "n m c h w -> (n m) c h w")
         y = rearrange(y, "n m c h w -> (n m) c h w")

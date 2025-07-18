@@ -51,7 +51,8 @@ def prepare_batch_for_model(batch, device):
         "image": _move(batch["source_rgbs"]),
         "latent_points": _move(batch["tokens"]),
     }
-    
+    prepared["src_w2cs"] = _move(batch["source_w2cs"])
+    prepared["src_intrs"] = _move(batch["source_intrs"])
     prepared["render_w2cs"]   = _move(batch["driving_w2cs"])
     prepared["render_intrs"]  = _move(batch["driving_intrs"])
     prepared["render_bg_colors"] = _move(batch["render_bg_colors"])

@@ -120,8 +120,8 @@ class CafcaLamDataset(Dataset):
                         "image_file_path": str(image_file),
                         "mask_file_path": str(mask_file),
                         "subject_flame_param_path": str(flame_params_path),
-                        "world_2_cam_np": np.array(cam_params["world2cam"], dtype=np.float16),
-                        "intrinsic_np": np.array(cam_params["K"], dtype=np.float16),
+                        "world_2_cam_np": np.array(cam_params["world2cam"]),
+                        "intrinsic_np": np.array(cam_params["K"]),
                         "token_file_path": str(token_file),
                         "is_source_candidate": cam_id in self.allowed_source_cams.get(subject_int, set()),
                     }
@@ -244,7 +244,7 @@ class CafcaLamDataset(Dataset):
         subject_flame_params = self._load_subject_flame_params(
             subject_frames_info[source_frame_indices[0]]["subject_flame_param_path"])
 
-        source_images_list, source_cam_ids_list, source_img_tokens_list = [], [], []
+        source_images_list, source_cam_ids_list, source_img_tokens_list, source_w2cs_list, source_intrs_list = [], [], [], [], []
         for s_idx in source_frame_indices:
             meta = subject_frames_info[s_idx]
             source_images_list.append(self._load_image_as_tensor(meta["image_file_path"]))
@@ -253,6 +253,12 @@ class CafcaLamDataset(Dataset):
             # source_img_tokens_list.append(torch.from_numpy(npz_token["tokens"]))
 
             source_img_tokens_list.append(torch.from_numpy(npz_token["tokens"]))
+            source_w2cs_list.append(torch.from_numpy(meta["world_2_cam_np"]).float())
+            source_intrs_list.append(torch.from_numpy(meta["intrinsic_np"]))
+
+
+
+
             # source_img_tokens_list.append(self._get_token_tensor(meta["token_file_path"]))
             # source_img_tokens_list.append(torch.zeros((20018, 1024), dtype=torch.float16))
 
@@ -277,6 +283,8 @@ class CafcaLamDataset(Dataset):
         # ------------------------------------------------------------------
         out_item = {
             "source_rgbs": torch.stack(source_images_list),
+            "source_w2cs": torch.stack(source_w2cs_list),
+            "source_intrs": torch.stack(source_intrs_list),
             "tokens": torch.stack(source_img_tokens_list),
             "driving_image": torch.stack(driving_images_list),
             "driving_w2cs": torch.stack(driving_w2cs_list),
@@ -311,16 +319,19 @@ class CafcaLamDataset(Dataset):
             subject_frames_info[source_frame_indices[0]]['subject_flame_param_path']
         )
 
-        source_images_list, source_cam_ids_list, source_img_tokens_list = [], [], []
+        source_images_list, source_cam_ids_list, source_img_tokens_list, source_w2cs_list, source_intrs_list = [], [], [], [], []
         for s_idx in source_frame_indices:
             meta = subject_frames_info[s_idx]
             source_images_list.append(self._load_image_as_tensor(meta["image_file_path"]))
             npz_token = np.load(meta["token_file_path"])
             source_img_tokens_list.append(torch.from_numpy(npz_token["tokens"]))
             source_cam_ids_list.append(meta["cam_id"])
-
+            source_w2cs_list.append(torch.from_numpy(meta["world_2_cam_np"]).float())
+            source_intrs_list.append(torch.from_numpy(meta["intrinsic_np"]))
         out_item = {
             "source_rgbs": torch.stack(source_images_list).unsqueeze(0),
+            "source_w2cs": torch.stack(source_w2cs_list).unsqueeze(0),
+            "source_intrs": torch.stack(source_intrs_list).unsqueeze(0),
             "tokens": torch.stack(source_img_tokens_list).unsqueeze(0),
             "driving_image": torch.empty(1, 0),
             "driving_w2cs": torch.empty(1, 0),
@@ -334,7 +345,7 @@ class CafcaLamDataset(Dataset):
 
         out_item['betas'] = subject_flame_params['betas']
         for k, v_tensor in subject_flame_params.items():
-            out_item[k] = v_tensor.unsqueeze(0).repeat(4, 1)  # match __getitem__ format, but leave driving part empty
+            out_item[k] = v_tensor.unsqueeze(0).repeat(1, 1)  # match __getitem__ format, but leave driving part empty
 
         return out_item
     

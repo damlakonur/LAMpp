@@ -9,12 +9,20 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
 # limitations under the License.
 
 import os
 import torch.nn.functional as F
 import math
+import pyvista as pv
+import trimesh
+import cv2
+import numpy as np
+from pytorch3d.ops import mesh_face_areas_normals
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import (
+    PerspectiveCameras, RasterizationSettings, MeshRasterizer
+)
 from collections import defaultdict
 import numpy as np
 import torch
@@ -31,8 +39,17 @@ from dreifus.vector import Vec3
 from tqdm import tqdm
 import os
 from dreifus.matrix import Intrinsics, Pose
+from lam.models.rendering.utils.mesh_utils import axis_angle_to_matrix
 
 logger = get_logger(__name__)
+
+def extract_camera_centers(source_view_w2cs):
+    # Extract rotation and translation explicitly
+    R = source_view_w2cs[..., :3, :3]       # [...,3,3]
+    t = source_view_w2cs[..., :3, 3]        # [...,3]   ←  **note :3, 3  (not 3:)**
+
+    C = -(R.transpose(-1, -2) @ t.unsqueeze(-1)).squeeze(-1)   # [...,3]
+    return C
 
 
 class ModelLAM(nn.Module):
@@ -124,16 +141,26 @@ class ModelLAM(nn.Module):
             # initialzie it with zeros
             # self.fusion_layer = nn.Linear(transformer_dim * self.num_source_views, transformer_dim)
             
-            hidden_dim = transformer_dim // 4  
-            self.view_weighting = nn.Sequential(
-                nn.Linear(transformer_dim, hidden_dim),
+            # hidden_dim = transformer_dim // 4  
+            # self.view_weighting = nn.Sequential(
+            #     nn.Linear(transformer_dim, hidden_dim),
+            #     nn.SiLU(),
+            #     nn.Linear(hidden_dim, 1)  # scalar weight per point per view
+            # )
+            # self.fusion_layer = nn.Linear(transformer_dim, transformer_dim)
+            # nn.init.zeros_(self.fusion_layer.weight)
+            # nn.init.zeros_(self.fusion_layer.bias)
+
+            # ------------------------------------------------------------------ #
+            # New: MLP-based fusion that leverages visibility scores and Plücker
+            #      coordinates, followed by a self-attention refinement.
+            # ------------------------------------------------------------------ #
+            concat_dim = 2 * (transformer_dim + 6 + 1)  # latent + plücker(6) + vis(1)
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(concat_dim, transformer_dim),
                 nn.SiLU(),
-                nn.Linear(hidden_dim, 1)  # scalar weight per point per view
+                nn.Linear(transformer_dim, transformer_dim),
             )
-            self.fusion_layer = nn.Linear(transformer_dim, transformer_dim)
-            nn.init.zeros_(self.fusion_layer.weight)
-            nn.init.zeros_(self.fusion_layer.bias)
-            self.layer_norm = nn.LayerNorm(transformer_dim)
         
         # renderer
         self.renderer = GS3DRenderer(human_model_path=human_model_path,
@@ -239,40 +266,241 @@ class ModelLAM(nn.Module):
 
         return tokens, image_feats
 
-    def forward(self, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
+    def vis_mask_rasterizer(
+            self,
+            verts,                  # (B, N, 3)
+            faces,                  # (F, 3)
+            cam_R, cam_T, K,        # (B, V, 3, 3)  or (B, V, 4, 4)
+            image_size=(256, 256),
+    ):
+        device = verts.device
+        N       = verts.shape[1]
+        num_faces = faces.shape[0]
+        H, W = image_size
+        B, V, _ = cam_T.shape
+
+        eye44 = torch.eye(4, device=device, dtype=verts.dtype)
+        K44   = eye44.view(1, 1, 4, 4).repeat(B, V, 1, 1)
+        K44[:, :, :3, :3] = K.float()
+        K44[..., 0,0] *= 0.5
+        K44[..., 1,1] *= 0.5
+        K44[..., 0,2] *= 0.5
+        K44[..., 1,2] *= 0.5
+
+
+        # ------------------------------------------------------------------ #
+        with torch.cuda.amp.autocast(False):
+            mesh_batch = Meshes(verts=verts, faces=faces.unsqueeze(0).repeat(B, 1, 1))
+            faces_packed   = mesh_batch.faces_packed()      # (B*F, 3)
+            first_idx_face = mesh_batch.mesh_to_faces_packed_first_idx()  # (B,)
+            first_idx_vert = mesh_batch.mesh_to_verts_packed_first_idx()
+
+            rasteriser = MeshRasterizer(
+                raster_settings = RasterizationSettings(
+                    image_size      = image_size,
+                    faces_per_pixel = 1,
+                    blur_radius     = 0.0,
+                    max_faces_per_bin=128_000
+                )
+            )
+            vis = torch.zeros((B, V, N), dtype=torch.bool, device=device)
+
+            for v in range(V):
+                cameras = PerspectiveCameras(
+                    R          = cam_R[:, v].float(),
+                    T          = cam_T[:, v].float(),
+                    K          = K44[:, v].float(),
+                    image_size = torch.tensor([H, W], device=device).repeat(B, 1),
+                    in_ndc     = False,
+                    device     = device,
+                )
+
+                frags = rasteriser(mesh_batch, cameras=cameras)
+                pix_to_face = frags.pix_to_face[..., 0]
+
+                # ---- gather per-mesh visible vertices --------------------------------
+                for b in range(B):
+                    f_start = first_idx_face[b]
+                    f_end   = f_start + num_faces
+
+                    face_ids = pix_to_face[b].unique()
+                    face_ids = face_ids[(face_ids >= f_start) & (face_ids < f_end)]
+                    if face_ids.numel() == 0:
+                        continue
+                    v_ids = faces_packed[face_ids].view(-1).unique()
+                    v_ids_local  = v_ids - first_idx_vert[b]
+                    vis[b, v, v_ids_local] = True
+
+        return vis
+    
+
+    def save_visibility_snapshot(
+            self,
+            mesh_pv,        # PyVista PolyData of **the first mesh**
+            verts,          # (20018, 3)  torch or numpy – first mesh's verts
+            ray_vis0,       # torch.bool (2, 20018) – first mesh, two views
+            cam_pos,
+            out_png="vis_c00_c06.png",
+            window=(512, 512),
+    ):
+        """
+        Colours vertices:
+            red     – visible only from C00  (ray_vis0[0])
+            blue    – visible only from C06  (ray_vis0[1])
+            magenta – visible from both
+            grey    – from neither
+        and saves an off-screen PNG.
+        """
+        # verts = query_points[0].cpu().numpy()
+        # faces = faces.cpu().numpy()
+        # faces_pv = np.hstack([np.full((faces.shape[0], 1), 3), faces])
+        # mesh = pv.PolyData(verts, faces_pv)
+        # self.save_visibility_snapshot(
+        #     mesh_pv      = mesh,     # pre-loaded PolyData
+        #     verts     = query_points[0],       # (N,3) torch
+        #     ray_vis0   = w_raw_bool[0],               # (B,V,N) torch.bool
+        #     cam_pos= cam_centers[0, 0].detach().cpu().numpy() ,
+        #     out_png   = "visibility_step2.png",
+        # )
+        # self.save_visibility_snapshot(
+        #     mesh_pv      = mesh,     # pre-loaded PolyData
+        #     verts     = query_points[1],       # (N,3) torch
+        #     ray_vis0   = w_raw_bool[1],               # (B,V,N) torch.bool
+        #     cam_pos= cam_centers[1, 0].detach().cpu().numpy() ,
+        #     out_png   = "visibility_step3.png",
+        # )
+
+        # breakpoint()
+
+        # 1. convert to numpy
+        vis_c00 = ray_vis0[0].cpu().numpy()
+        vis_c06 = ray_vis0[1].cpu().numpy()
+
+        if torch.is_tensor(verts):
+            verts = verts.cpu().numpy()
+
+        # 2. colour array
+        colours = np.full((verts.shape[0], 3), 0.5, dtype=np.float32)  # grey
+        colours[vis_c06]         = [1.0, 0.0, 0.0]   # red
+        colours[vis_c00]         = [0.0, 0.0, 1.0]   # blue
+        colours[vis_c00 & vis_c06] = [1.0, 0.0, 1.0] # magenta
+
+        # 3. render
+        p = pv.Plotter(off_screen=True, window_size=window)
+        p.set_background("white")
+        p.add_mesh(mesh_pv, color="lightgray", opacity=0.25, show_edges=False)
+        focal   = np.array([0.0, 0.0, 0.0])   # look-at target (e.g. scene origin)
+        view_up = np.array([0.0, 1.0, 0.0])   # camera's 'up' direction (Y-axis)
+
+        p.camera_position = [cam_pos, focal, view_up]
+        p.add_points(
+            verts,
+            scalars=colours,
+            rgb=True,
+            point_size=6,
+            render_points_as_spheres=True,
+        )
+        p.show(screenshot=out_png)
+        print(f"[✓] wrote {out_png}")
+
+    def forward(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
         assert len(flame_params["betas"].shape) == 2
         render_h, render_w = 512, 512
         query_points = None
-        if latent_points.ndim >= 3:
-            # if n_src == 2:
-            #     latent_points = latent_points.mean(dim=1, keepdim=False)
-            if hasattr(self, 'fusion_layer') and self.num_source_views > 1:
-                # first average it 
-                B, V, N, D = latent_points.shape
-                avg_points = latent_points.mean(dim=1, keepdim=False)
-                
-                # latent_points = latent_points.permute(0, 2, 1, 3).reshape(latent_points.size(0), latent_points.size(2), -1)
-                # latent_points = latent_points.float() 
-                # latent_points = self.fusion_layer(latent_points)
-                # latent_points += avg_points
-                
-                # latent_points shape: [B, num_views=2, num_points=N, dim=D]
-                weights = self.view_weighting(latent_points) # [B, 2, N, 1]
-                weights = F.softmax(weights, dim=1) # softmax across views per-point
-
-                # Weighted aggregation: [B, N, D]
-                aggregated_points = (latent_points * weights).sum(dim=1)
-                latent_points = self.fusion_layer(aggregated_points) + avg_points
-                latent_points = self.layer_norm(latent_points)
-                
-
-
-            elif self.num_source_views == 1:
-                latent_points = latent_points.squeeze(1)
-
         if self.latent_query_points_type.startswith("e2e_flame"):
-            query_points, flame_params = self.renderer.get_query_points(flame_params,
+            query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(flame_params,
                                                                         device=render_w2cs.device)
+        if latent_points.ndim >= 3 and self.num_source_views > 1:
+            # #### The following part is important to obtain canonical-cam-params #####
+            axis_angle = flame_params["rotation"][:, 0, :]     # [B, 3]
+            translation = flame_params["translation"][:, 0, :]  # [B, 3]
+            R_c2w = axis_angle_to_matrix(axis_angle)  # [B, 3, 3]
+            p = torch.eye(4, dtype=translation.dtype, device=translation.device).unsqueeze(0).repeat(src_w2cs.shape[0], 1, 1)
+            p[:, :3, :3] = R_c2w
+            p[:, :3, 3] = translation
+            p_inv = torch.linalg.inv(p) 
+            src_w2cs = p_inv[:, None] @ src_w2cs       
+            #########################################################################
+
+            R_world2cam = src_w2cs[:, :, :3, :3]           # (B,V,3,3)
+            T_world2cam = src_w2cs[:, :, :3, 3]            # (B,V,3)
+            # cam_centers = src_w2cs[:, :, :3, 3] # when using cam2world
+            ############ Visibility according to vertex normals #####################
+            cam_centers = extract_camera_centers(src_w2cs).unsqueeze(2)    # [B, V, 1, 3]
+            vertex_positions = query_points.unsqueeze(1)   # [B, 1, N, 3]
+            vertex_normals = surf_normals.unsqueeze(1)     # [B, 1, N, 3]
+            # rays from vertex toward camera
+            ray_dirs = cam_centers - vertex_positions      # [B, V, N, 3]
+            ray_dirs = torch.nn.functional.normalize(ray_dirs, dim=-1)
+            # front-facing mask
+            cos_theta  = (ray_dirs * vertex_normals).sum(-1)   # [B, V, N]
+            front_mask = (cos_theta > 0).float() 
+            ############### Visibility according to mesh rasterization ##############
+            ray_vis = self.vis_mask_rasterizer(   # [B,V,N]  
+                        verts=query_points,
+                        faces=faces,
+                        cam_R=R_world2cam,
+                        cam_T=T_world2cam.float(),
+                        K=src_intrs)
+            # 2. final per-vertex, per-view weight
+            w_raw = front_mask * ray_vis.float()                # [B,V,N]
+            # Geometric Visibility Weighting    
+            # visible_mask   = (w_raw > 0)                       # [B,V,N]
+            # count_visible  = visible_mask.sum(dim=1, keepdim=True)  # [B,1,N]
+
+            # V = w_raw.shape[1]
+            # w_fuse = torch.where(
+            #     (count_visible == 0) | (count_visible == V),
+            #     torch.full_like(w_raw, 1.0 / V),               # 50% - 50%
+            #     visible_mask.float(),                          # 1 / 0
+            # )
+
+            # latent_points = (w_fuse.unsqueeze(-1) * latent_points).sum(dim=1)  # [B,N,D]
+            # ############### first method #############
+            # latent_points = latent_points.permute(0, 2, 1, 3).reshape(latent_points.size(0), latent_points.size(2), -1)
+            # latent_points = latent_points.float() 
+            # latent_points = self.fusion_layer(latent_points)
+            # latent_points += avg_points
+            # latent_points = latent_points.mean(dim=1, keepdim=False)
+            
+            
+            ############### second method #############
+            # latent_points = latent_points.float() 
+            # weights = self.view_weighting(latent_points) # [B, 2, N, 1]
+            # weights = F.softmax(weights, dim=1) # softmax across views per-point
+            # aggregated_points = (latent_points * weights).sum(dim=1)
+            # latent_points = self.fusion_layer(aggregated_points) + avg_points
+            # latent_points = self.layer_norm(latent_points)
+            
+            ############## third method #############
+            # --- Learnable Plücker-based fusion ---------------------------------
+            # latent_points : [B, 2, N, D]
+            # w_raw         : [B, 2, N]            – visibility score (0/1 per ray)
+            # Compute Plücker coordinates for each camera-to-point ray            
+            cam_pos  = cam_centers.expand(-1, -1, ray_dirs.shape[2], -1)  # [B,2,N,3]
+            
+            l_vec    = ray_dirs                                         # already norm
+            m_vec    = torch.cross(cam_pos, l_vec, dim=-1)              # moment
+            plucker  = torch.cat([l_vec, m_vec], dim=-1)                # [B,2,N,6]
+
+            # Build fusion input: latent | plücker | visibility
+            vis_feat   = w_raw.unsqueeze(-1)                             # [B,2,N,1]
+            fuse_per_view = torch.cat([latent_points, plucker, vis_feat], dim=-1)  # [B,2,N,D+7]
+
+            # ------------------------------------------------------------------
+            # Concatenate the two views per point, let the MLP learn the fusion
+            # ------------------------------------------------------------------
+            fuse_cat = fuse_per_view.permute(0, 2, 1, 3).reshape(
+                fuse_per_view.size(0),  # B
+                fuse_per_view.size(2),  # N
+                -1                      # 2*(D+7)
+            )  # [B, N, 2*(D+7)]
+
+            latent_points = self.fusion_mlp(fuse_cat)   # [B, N, D]
+
+        elif self.num_source_views == 1:
+            latent_points = latent_points.squeeze(1)
+
         render_results = self.renderer(gs_hidden_features=latent_points,
                                        query_points=query_points,
                                        flame_data=flame_params,
@@ -315,9 +543,8 @@ class ModelLAM(nn.Module):
         query_points = None
         
         if self.latent_query_points_type.startswith("e2e_flame"):
-            query_points, flame_params = self.renderer.get_query_points(flame_params,
+            query_points, flame_params, _, _ = self.renderer.get_query_points(flame_params,
                                                                         device=image.device)
-        breakpoint()
         latent_points, image_feats = self.forward_latent_points(image[:, 0], camera=None, query_points=query_points)  # [B, N, C]
         image_feats_bchw = rearrange(image_feats, "b (h w) c -> b c h w", h=int(math.sqrt(image_feats.shape[1])))
 

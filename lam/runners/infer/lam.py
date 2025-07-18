@@ -16,10 +16,16 @@ import time
 import torch
 import os
 import argparse
+from torchmetrics.image import (
+    PeakSignalNoiseRatio as PSNR,
+    StructuralSimilarityIndexMeasure as SSIM,
+)
+from lam.losses import LPIPSLoss, PixelLoss
 import mcubes
 import trimesh
 import numpy as np
 from PIL import Image
+from tools.flame_tracking_single_image import FlameTrackingSingleImage, expand_bbox
 from glob import glob
 import cv2
 from omegaconf import OmegaConf
@@ -153,6 +159,17 @@ class LAMInferrer(Inferrer):
             self.cafca_loader = torch.utils.data.DataLoader(
                 self.cafca_dataset, batch_size=1, shuffle=False, num_workers=0 # Batch size 1 for inference
             )
+        self.flametracking = FlameTrackingSingleImage(output_dir='tracking_output',
+                                             alignment_model_path='./model_zoo/flame_tracking_models/68_keypoints_model.pkl',
+                                             vgghead_model_path='./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd',
+                                             human_matting_path='./model_zoo/flame_tracking_models/matting/stylematte_synth.pt',
+                                             facebox_model_path='./model_zoo/flame_tracking_models/FaceBoxesV2.pth',
+                                             detect_iris_landmarks=True,
+                                             args = self.cfg)
+        self.l1_loss_fn = PixelLoss(option='l1')
+        self.lpips_loss_fn = LPIPSLoss(device=self.device, prefetch=True)
+        self.psnr_metric = PSNR(data_range=1.0).to(self.device)
+        self.ssim_metric = SSIM(data_range=1.0).to(self.device)
 
     def _build_model(self, cfg):
         """
@@ -255,6 +272,7 @@ class LAMInferrer(Inferrer):
     def infer_single(self, image_path: str,
                      mask_path_for_preprocess: str, # Path to the original mask
                      target_intrinsics: np.ndarray, # Intrinsics for the target image
+                     target_img: str, # Path to the target image
                      canonical_flame_path_for_subject: str, # Path to subject's canonical_flame_param.npz
                      world2cam: np.ndarray, # Camera to canonical flame transformation
                      motion_seqs_dir, 
@@ -313,75 +331,94 @@ class LAMInferrer(Inferrer):
                                                render_bg_colors=rendered_bg_colors.to(device),
                                                flame_params={k:v.to(device) for k, v in flame_params.items()})
 
-        self.model.save_video(dump_video_path, image.unsqueeze(0).to(device, dtype), flame_params= {k:v.to(device) for k, v in flame_params.items()}, intrinsics=render_intrs_single.to(device), render_bg_color=rendered_bg_colors.to(device))
+        # self.model.save_video(dump_video_path, image.unsqueeze(0).to(device, dtype), flame_params= {k:v.to(device) for k, v in flame_params.items()}, intrinsics=render_intrs_single.to(device), render_bg_color=rendered_bg_colors.to(device))
         
         rgb = res["comp_rgb"].detach().cpu().numpy()  # [Nv, H, W, 3], 0-1
         rgb = (np.clip(rgb, 0, 1.0) * 255).astype(np.uint8)
         only_pred = rgb.copy()
-        # if vis_motion:
-        #     # print(rgb.shape, motion_seq["vis_motion_render"].shape)
-        #     vis_ref_img = np.tile(img_orig, (rgb.shape[0], 1, 1, 1))
-        #     blend_ratio = 0.7
-        #     blend_res = ((1 -  blend_ratio) * rgb + blend_ratio * motion_render).astype(np.uint8)
-        #     rgb = np.concatenate([rgb, motion_render, blend_res, vis_ref_img], axis=2)
-        #     rgb = np.concatenate([vis_ref_img, rgb, motion_render], axis=2)
+        
+
             
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
-        # images_to_video(rgb, output_path=dump_video_path, fps=render_fps, gradio_codec=False, verbose=True)
-        
-        # self.save_imgs_2_video(rgb, dump_video_path, render_fps)
-        # rgb = (np.clip(rgb, 0, 1.0) * 255).astype(np.uint8)
+
         save_path = os.path.join(dump_image_dir, "frame0.png")
         Image.fromarray(rgb[0]).save(save_path)
-        # base_vid = motion_seqs_dir.strip('/').split('/')[-1]
-        # audio_path = os.path.join(motion_seqs_dir, base_vid+".wav")
-        # dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
-        # self.add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
         if save_img and dump_image_dir is not None:
             for i in range(rgb.shape[0]):
                 save_file = os.path.join(dump_image_dir, f"{i:04d}.png")
                 Image.fromarray(only_pred[i]).save(save_file)
                 if save_ply and dump_mesh_path is not None:
                     res["3dgs"][i][0][0].save_ply(os.path.join(dump_image_dir, f"{i:04d}.ply"))
+            from pathlib import Path
+            # This assumes Nv=1 since we are in infer_single for one target view
+            pred_pil = Image.fromarray(rgb[0])
+            W, H = pred_pil.size
 
-            dump_cano_dir = "./exps/cano_gs/"
-            if not os.path.exists(dump_cano_dir):
-                os.system(f"mkdir -p {dump_cano_dir}")
-            cano_ply_pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + ".ply")
-            # res['cano_gs_lst'][0].save_ply(cano_ply_pth, rgb2sh=True, offset2xyz=False)
-            cano_ply_pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + "_gs_offset.ply")
-            res['cano_gs_lst'][0].save_ply(cano_ply_pth, rgb2sh=False, offset2xyz=True)
-            # res['cano_gs_lst'][0].save_ply("tmp.ply", rgb2sh=False, offset2xyz=True)
+            # Load source and target (driving) images
+            try:
+                src_pil = Image.open(image_path).convert("RGB").resize((W, H))
+                gt_pil = Image.open(target_img).convert("RGB").resize((W, H))
 
-            def save_color_points(points, colors, sv_pth, sv_fd="debug_vis/dataloader/"):
-                points = points.squeeze().detach().cpu().numpy()
-                colors = colors.squeeze().detach().cpu().numpy()
-                sv_pth = os.path.join(sv_fd, sv_pth)
-                if not os.path.exists(sv_fd):
-                    os.system(f"mkdir -p {sv_fd}")
-                with open(sv_pth, 'w') as of:
-                    for point, color in zip(points, colors):
-                        print('v', point[0], point[1], point[2], color[0], color[1], color[2], file=of)
+                # Create and save composite image
+                comp = Image.new("RGB", (W * 3, H))
+                comp.paste(src_pil, (0, 0))
+                comp.paste(gt_pil, (W, 0))
+                comp.paste(pred_pil, (2*W, 0))
+
+                # Extract clean filenames for composite
+                src_stem = Path(image_path).stem
+                tgt_stem = Path(target_img).stem
+                comp_path = os.path.join(dump_image_dir, f"composite_{src_stem}_to_{tgt_stem}.png")
+                comp.save(comp_path)
+                logger.info(f"Saved composite view to {comp_path}")
+
+                # ---------- Calculate Metrics ----------
+                # res["comp_rgb"] is [Nv, H, W, 3] on device. Nv=1 here.
+                pred_t = res["comp_rgb"][0].permute(2, 0, 1).unsqueeze(0) # [1, 3, H, W]
+                gt_np = np.array(gt_pil).astype(np.float32) / 255.0
+                gt_t = torch.from_numpy(gt_np).permute(2, 0, 1).unsqueeze(0).to(self.device)
+                print(f"Metrics for {src_stem}_to_{tgt_stem}: L1={self.l1_loss_fn(pred_t, gt_t).item():.4f}, LPIPS={self.lpips_loss_fn(pred_t, gt_t).item():.4f}, PSNR={self.psnr_metric(pred_t, gt_t).item():.2f}, SSIM={self.ssim_metric(pred_t, gt_t).item():.4f}")
+            except FileNotFoundError as e:
+                logger.warning(f"Could not create composite or calculate metrics: {e}")
+
+            # dump_cano_dir = "./exps/cano_gs/"
+            # if not os.path.exists(dump_cano_dir):
+            #     os.system(f"mkdir -p {dump_cano_dir}")
+            # cano_ply_pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + ".ply")
+            # # res['cano_gs_lst'][0].save_ply(cano_ply_pth, rgb2sh=True, offset2xyz=False)
+            # cano_ply_pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + "_gs_offset.ply")
+            # res['cano_gs_lst'][0].save_ply(cano_ply_pth, rgb2sh=False, offset2xyz=True)
+            # # res['cano_gs_lst'][0].save_ply("tmp.ply", rgb2sh=False, offset2xyz=True)
+
+            # def save_color_points(points, colors, sv_pth, sv_fd="debug_vis/dataloader/"):
+            #     points = points.squeeze().detach().cpu().numpy()
+            #     colors = colors.squeeze().detach().cpu().numpy()
+            #     sv_pth = os.path.join(sv_fd, sv_pth)
+            #     if not os.path.exists(sv_fd):
+            #         os.system(f"mkdir -p {sv_fd}")
+            #     with open(sv_pth, 'w') as of:
+            #         for point, color in zip(points, colors):
+            #             print('v', point[0], point[1], point[2], color[0], color[1], color[2], file=of)
  
-            # save canonical color point clouds
-            save_color_points(res['cano_gs_lst'][0].xyz, res["cano_gs_lst"][0].shs[:, 0, :], "framework_img.obj", sv_fd=dump_cano_dir) 
+            # # save canonical color point clouds
+            # save_color_points(res['cano_gs_lst'][0].xyz, res["cano_gs_lst"][0].shs[:, 0, :], "framework_img.obj", sv_fd=dump_cano_dir) 
 
-            # Export the template mesh to an OBJ file
-            import trimesh
-            vtxs = res['cano_gs_lst'][0].xyz - res['cano_gs_lst'][0].offset
-            vtxs = vtxs.detach().cpu().numpy() 
-            faces = self.model.renderer.flame_model.faces.detach().cpu().numpy()
-            mesh = trimesh.Trimesh(vertices=vtxs, faces=faces)
-            mesh.export(os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + '_shaped_mesh.obj'))
+            # # Export the template mesh to an OBJ file
+            # import trimesh
+            # vtxs = res['cano_gs_lst'][0].xyz - res['cano_gs_lst'][0].offset
+            # vtxs = vtxs.detach().cpu().numpy() 
+            # faces = self.model.renderer.flame_model.faces.detach().cpu().numpy()
+            # mesh = trimesh.Trimesh(vertices=vtxs, faces=faces)
+            # mesh.export(os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + '_shaped_mesh.obj'))
 
-            # Export textured deformed mesh
-            import lam.models.rendering.utils.mesh_utils as mesh_utils
-            vtxs = res['cano_gs_lst'][0].xyz.detach().cpu()
-            faces = self.model.renderer.flame_model.faces.detach().cpu()
-            colors = res['cano_gs_lst'][0].shs.squeeze(1).detach().cpu()
-            pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + '_textured_mesh.obj')
-            print("Save textured mesh to:", pth)
-            mesh_utils.save_obj(pth, vtxs, faces, textures=colors, texture_type="vertex")
+            # # Export textured deformed mesh
+            # import lam.models.rendering.utils.mesh_utils as mesh_utils
+            # vtxs = res['cano_gs_lst'][0].xyz.detach().cpu()
+            # faces = self.model.renderer.flame_model.faces.detach().cpu()
+            # colors = res['cano_gs_lst'][0].shs.squeeze(1).detach().cpu()
+            # pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + '_textured_mesh.obj')
+            # print("Save textured mesh to:", pth)
+            # mesh_utils.save_obj(pth, vtxs, faces, textures=colors, texture_type="vertex")
 
     def infer(self):
         if self.cafca_loader is not None and self.cfg.get('use_cafca_dataset', False):
@@ -410,75 +447,84 @@ class LAMInferrer(Inferrer):
 
         target_world2cam = found_driving_item["world_2_cam"]
         target_intrinsics = found_driving_item["intrinsic"]
+        target_img = found_driving_item["image_file_path"]
+
         if isinstance(target_world2cam, torch.Tensor):
             target_world2cam = target_world2cam.cpu().numpy()
             
         
 
         for data_item_batch in tqdm(iterable_data_for_loop, disable=not self.accelerator.is_local_main_process):
-            try:
-                if input_source_is_cafca:
-                    # Item from CafcaLamDataset DataLoader (batch size 1)
-                    ref_image_path = data_item_batch["image_file_path"][0]
-                    ref_mask_path = data_item_batch["mask_file_path"][0]
-                    # Intrinsics are already numpy arrays from CafcaLamDataset
-                    ref_canonical_flame_path = data_item_batch["canonical_flame_param_path"][0]
-                    subject_id_str_ref = data_item_batch["subject_id_str"][0]
-                    cam_id_ref = data_item_batch["cam_id"][0]
-                    ref_world2cam = data_item_batch["world_2_cam"][0]
-                    if isinstance(ref_world2cam, torch.Tensor):
-                        ref_world2cam = ref_world2cam.cpu().numpy()
-                    
-                    
-                    uid = f"{subject_id_str_ref}_{cam_id_ref}"
-                    dump_subdir = subject_id_str_ref
+            # return_code = self.flametracking.preprocess(data_item_batch["image_file_path"][0])
+            # assert (return_code == 0), "flametracking preprocess failed!"
+            # return_code = self.flametracking.optimize()
+            # assert (return_code == 0), "flametracking optimize failed!"
+            # return_code, output_dir = self.flametracking.export()
+            # assert (return_code == 0), "flametracking export failed!"
 
-                motion_seqs_dir = self.cfg.motion_seqs_dir
-                print("motion_seqs_dir:", motion_seqs_dir)
+            # image_path = os.path.join(output_dir, "images/00000_00.png")
+            # mask_path = image_path.replace("/images/", "/fg_masks/").replace(".jpg", ".png")
+            if input_source_is_cafca:
+                # Item from CafcaLamDataset DataLoader (batch size 1)
+                ref_image_path = data_item_batch["image_file_path"][0]
+                ref_mask_path = data_item_batch["mask_file_path"][0]
+                # Intrinsics are already numpy arrays from CafcaLamDataset
+                ref_canonical_flame_path = data_item_batch["canonical_flame_param_path"][0]
+                subject_id_str_ref = data_item_batch["subject_id_str"][0]
+                cam_id_ref = data_item_batch["cam_id"][0]
+                ref_world2cam = data_item_batch["world_2_cam"][0]
+                if isinstance(ref_world2cam, torch.Tensor):
+                    ref_world2cam = ref_world2cam.cpu().numpy()
+                
+                
+                uid = f"{subject_id_str_ref}_{cam_id_ref}"
+                dump_subdir = subject_id_str_ref
 
-                dump_video_path = os.path.join(
-                    self.cfg.video_dump,
-                    dump_subdir,
-                    f'{uid}.mp4',
-                )
-                dump_image_dir = os.path.join(
-                    self.cfg.image_dump,
-                    dump_subdir,
-                    f'{uid}'
-                )
-                dump_tmp_dir = os.path.join(
-                    self.cfg.image_dump,
-                    dump_subdir,
-                    "tmp_res"
-                )
-                dump_mesh_path = os.path.join(
-                    self.cfg.mesh_dump,
-                    dump_subdir,
-                    # f'{uid}.ply',
-                )
-                os.makedirs(dump_image_dir, exist_ok=True)
-                os.makedirs(dump_tmp_dir, exist_ok=True)
-                os.makedirs(dump_mesh_path, exist_ok=True)
+            motion_seqs_dir = self.cfg.motion_seqs_dir
+            print("motion_seqs_dir:", motion_seqs_dir)
 
-                # if os.path.exists(dump_video_path):
-                #     print(f"skip:{image_path}")
-                #     continue
+            dump_video_path = os.path.join(
+                self.cfg.video_dump,
+                dump_subdir,
+                f'{uid}.mp4',
+            )
+            dump_image_dir = os.path.join(
+                self.cfg.image_dump,
+                dump_subdir,
+                f'{uid}'
+            )
+            dump_tmp_dir = os.path.join(
+                self.cfg.image_dump,
+                dump_subdir,
+                "tmp_res"
+            )
+            dump_mesh_path = os.path.join(
+                self.cfg.mesh_dump,
+                dump_subdir,
+                # f'{uid}.ply',
+            )
+            os.makedirs(dump_image_dir, exist_ok=True)
+            os.makedirs(dump_tmp_dir, exist_ok=True)
+            os.makedirs(dump_mesh_path, exist_ok=True)
 
-                self.infer_single(
-                    image_path=ref_image_path,
-                    mask_path_for_preprocess=ref_mask_path,
-                    target_intrinsics=target_intrinsics,
-                    canonical_flame_path_for_subject=ref_canonical_flame_path,
-                    world2cam=target_world2cam,
-                    motion_seqs_dir=motion_seqs_dir,
-                    motion_img_dir=self.cfg.motion_img_dir,
-                    motion_video_read_fps=self.cfg.motion_video_read_fps,
-                    export_video=self.cfg.export_video,
-                    export_mesh=self.cfg.export_mesh, 
-                    dump_tmp_dir=dump_tmp_dir,
-                    dump_image_dir=dump_image_dir,
-                    dump_video_path=dump_video_path,
-                    dump_mesh_path=dump_mesh_path,
-                    )
-            except:
-                traceback.print_exc()
+            # if os.path.exists(dump_video_path):
+            #     print(f"skip:{image_path}")
+            #     continue
+
+            self.infer_single(
+                image_path=ref_image_path,
+                mask_path_for_preprocess=ref_mask_path,
+                target_intrinsics=target_intrinsics,
+                target_img=target_img,
+                canonical_flame_path_for_subject=ref_canonical_flame_path,
+                world2cam=target_world2cam,
+                motion_seqs_dir=motion_seqs_dir,
+                motion_img_dir=self.cfg.motion_img_dir,
+                motion_video_read_fps=self.cfg.motion_video_read_fps,
+                export_video=self.cfg.export_video,
+                export_mesh=self.cfg.export_mesh, 
+                dump_tmp_dir=dump_tmp_dir,
+                dump_image_dir=dump_image_dir,
+                dump_video_path=dump_video_path,
+                dump_mesh_path=dump_mesh_path,
+                )

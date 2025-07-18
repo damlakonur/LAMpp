@@ -87,19 +87,32 @@ class LamLightningModel(pl.LightningModule):
             #         param.requires_grad = True
             #     logger.info("Unfroze parameters of model.layer_norm.")
             
-            # if hasattr(model, 'renderer') and hasattr(model.renderer, 'gs_net') and model.renderer.gs_net is not None:
-            #     for param in model.renderer.gs_net.parameters():
-            #         param.requires_grad = True
-            #     logger.info("Unfroze parameters of model.renderer.gs_net.")
+            if hasattr(model, 'renderer') and hasattr(model.renderer, 'gs_net') and model.renderer.gs_net is not None:
+                for param in model.renderer.gs_net.parameters():
+                    param.requires_grad = True
+                logger.info("Unfroze parameters of model.renderer.gs_net.")
             else:
-                logger.warning("model.renderer.mlp_net not found or is None. "
+                logger.warning("model.renderer.gs_net not found or is None. "
                                "No parameters specifically unfrozen for MLP fine-tuning. "
                                "Ensure model config `gs_mlp_network_config` is set if MLP is expected.")
+            for name, param in model.named_parameters():
+                print(f"Parameter: {name}, requires_grad: {param.requires_grad}")
+
+            # ---------- NEW: unfreeze plücker fusion modules ------------------- #
+            for attr in [
+                'fusion_mlp',            # two-layer MLP
+            ]:
+                if hasattr(model, attr) and getattr(model, attr) is not None:
+                    for p in getattr(model, attr).parameters():
+                        p.requires_grad = True
+                    logger.info(f"Unfroze parameters of model.{attr}.")
         return model
 
     def forward(self, batch):
         # model_input_data = prepare_batch_for_model(batch, self.device)
         return self.model(
+            src_w2cs=batch["src_w2cs"],
+            src_intrs=batch["src_intrs"],
             render_w2cs=batch["render_w2cs"],
             render_intrs=batch["render_intrs"],
             flame_params=batch["flame_params"],
@@ -110,6 +123,8 @@ class LamLightningModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         bs = batch["render_w2cs"].size(0)
         model_output = self.model(
+            src_w2cs=batch["src_w2cs"],
+            src_intrs=batch["src_intrs"],
             render_w2cs=batch["render_w2cs"],
             render_intrs=batch["render_intrs"],
             flame_params=batch["flame_params"],
@@ -142,8 +157,9 @@ class LamLightningModel(pl.LightningModule):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-
         model_output = self.model(
+            src_w2cs=batch["src_w2cs"],
+            src_intrs=batch["src_intrs"],
             render_w2cs=batch["render_w2cs"],
             render_intrs=batch["render_intrs"],
             flame_params=batch["flame_params"],
