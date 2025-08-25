@@ -79,8 +79,8 @@ class ModelLAM(nn.Module):
                  fix_rotation=False,
                  num_source_views=1,
                  flame_scale=1.0,
-                 instantiate_encoder=True,
-                 instantiate_transformer=True,
+                 instantiate_encoder=False,
+                 instantiate_transformer=False,
                  **kwargs,
                  ):
         super().__init__()
@@ -91,8 +91,8 @@ class ModelLAM(nn.Module):
         self.encoder_feat_dim = encoder_feat_dim
         self.conf_use_pred_img = False
         self.conf_cat_feat = False and self.conf_use_pred_img  # True # False
-        self.instantiate_encoder = instantiate_encoder
-        self.instantiate_transformer = instantiate_transformer
+        instantiate_encoder = False
+        instantiate_transformer = False
         self.num_source_views = num_source_views
         self.flame_scale = flame_scale
 
@@ -139,17 +139,21 @@ class ModelLAM(nn.Module):
         # To fuse information from n-views
         if self.num_source_views > 1:
             # initialzie it with zeros
+            # self.layer_norm = nn.LayerNorm(transformer_dim)
             # self.fusion_layer = nn.Linear(transformer_dim * self.num_source_views, transformer_dim)
             
+            # Method 2: Weighting-based fusion
             # hidden_dim = transformer_dim // 4  
             # self.view_weighting = nn.Sequential(
             #     nn.Linear(transformer_dim, hidden_dim),
             #     nn.SiLU(),
             #     nn.Linear(hidden_dim, 1)  # scalar weight per point per view
             # )
+            # self.layer_norm = nn.LayerNorm(transformer_dim)
             # self.fusion_layer = nn.Linear(transformer_dim, transformer_dim)
             # nn.init.zeros_(self.fusion_layer.weight)
             # nn.init.zeros_(self.fusion_layer.bias)
+            #########################################################################################
 
             # ------------------------------------------------------------------ #
             # New: MLP-based fusion that leverages visibility scores and Plücker
@@ -403,7 +407,162 @@ class ModelLAM(nn.Module):
         p.show(screenshot=out_png)
         print(f"[✓] wrote {out_png}")
 
-    def forward(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
+    def forward3(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points):
+        assert len(flame_params["betas"].shape) == 2
+        render_h, render_w = 512, 512
+        query_points = None
+        if self.latent_query_points_type.startswith("e2e_flame"):
+            query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(flame_params,
+                                                                        device=render_w2cs.device)
+        # #### The following part is important to obtain canonical-cam-params #####
+        axis_angle = flame_params["rotation"][:, 0, :]     # [B, 3]
+        translation = flame_params["translation"][:, 0, :]  # [B, 3]
+        R_c2w = axis_angle_to_matrix(axis_angle)  # [B, 3, 3]
+        p = torch.eye(4, dtype=translation.dtype, device=translation.device).unsqueeze(0).repeat(src_w2cs.shape[0], 1, 1)
+        p[:, :3, :3] = R_c2w
+        p[:, :3, 3] = translation
+        p_inv = torch.linalg.inv(p) 
+        src_w2cs = p_inv[:, None] @ src_w2cs       
+        #########################################################################
+
+        R_world2cam = src_w2cs[:, :, :3, :3]           # (B,V,3,3)
+        T_world2cam = src_w2cs[:, :, :3, 3]            # (B,V,3)
+        # cam_centers = src_w2cs[:, :, :3, 3] # when using cam2world
+        ############ Visibility according to vertex normals #####################
+        cam_centers = extract_camera_centers(src_w2cs).unsqueeze(2)    # [B, V, 1, 3]
+        vertex_positions = query_points.unsqueeze(1)   # [B, 1, N, 3]
+        vertex_normals = surf_normals.unsqueeze(1)     # [B, 1, N, 3]
+        # rays from vertex toward camera
+        ray_dirs = cam_centers - vertex_positions      # [B, V, N, 3]
+        ray_dirs = torch.nn.functional.normalize(ray_dirs, dim=-1)
+        # front-facing mask
+        cos_theta  = (ray_dirs * vertex_normals).sum(-1)   # [B, V, N]
+        front_mask = (cos_theta > 0).float() 
+        ############### Visibility according to mesh rasterization ##############
+        ray_vis = self.vis_mask_rasterizer(   # [B,V,N]  
+                    verts=query_points,
+                    faces=faces,
+                    cam_R=R_world2cam,
+                    cam_T=T_world2cam.float(),
+                    K=src_intrs)
+        # 2. final per-vertex, per-view weight
+        w_raw = front_mask * ray_vis.float()                # [B,V,N]
+        # Geometric Visibility Weighting    
+        visible_mask   = (w_raw > 0)                       # [B,V,N]
+        count_visible  = visible_mask.sum(dim=1, keepdim=True)  # [B,1,N]
+
+        V = w_raw.shape[1]
+        w_fuse = torch.where(
+            (count_visible == 0) | (count_visible == V),
+            torch.full_like(w_raw, 1.0 / V),               # 50% - 50%
+            visible_mask.float(),                          # 1 / 0
+        )
+
+        latent_points = (w_fuse.unsqueeze(-1) * latent_points).sum(dim=1)  # [B,N,D]
+
+        render_results = self.renderer(gs_hidden_features=latent_points,
+                                       query_points=query_points,
+                                       flame_data=flame_params,
+                                       w2c=render_w2cs,
+                                       intrinsic=render_intrs,
+                                       height=render_h,
+                                       width=render_w,
+                                       background_color=render_bg_colors,
+                                       additional_features=None
+        )
+
+        N, M = render_w2cs.shape[:2]
+        assert render_results['comp_rgb'].shape[0] in [N, N], "Batch size mismatch for render_results"
+        assert render_results['comp_rgb'].shape[1] in [M, M*2], "Number of rendered views should be consistent with render_cameras"
+
+        return {
+            # 'latent_points': latent_points,
+            **render_results,
+        }
+        
+    def forward1(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points):
+        assert len(flame_params["betas"].shape) == 2
+        render_h, render_w = 512, 512
+        query_points = None
+        if self.latent_query_points_type.startswith("e2e_flame"):
+            query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(flame_params,
+                                                                        device=render_w2cs.device)
+        if latent_points.ndim >= 3 and self.num_source_views > 1:
+            avg_points = latent_points.mean(dim=1, keepdim=False)
+            
+            ############### first method #############
+            latent_points = latent_points.float() 
+            latent_points = latent_points.permute(0, 2, 1, 3).reshape(latent_points.size(0), latent_points.size(2), -1)
+            latent_points = self.fusion_layer(latent_points)
+            latent_points += avg_points
+            
+
+        elif self.num_source_views == 1:
+            latent_points = latent_points.squeeze(1)
+
+        render_results = self.renderer(gs_hidden_features=latent_points,
+                                       query_points=query_points,
+                                       flame_data=flame_params,
+                                       w2c=render_w2cs,
+                                       intrinsic=render_intrs,
+                                       height=render_h,
+                                       width=render_w,
+                                       background_color=render_bg_colors,
+                                       additional_features=None
+        )
+
+        N, M = render_w2cs.shape[:2]
+        assert render_results['comp_rgb'].shape[0] in [N, N], "Batch size mismatch for render_results"
+        assert render_results['comp_rgb'].shape[1] in [M, M*2], "Number of rendered views should be consistent with render_cameras"
+
+        return {
+            # 'latent_points': latent_points,
+            **render_results,
+        }
+
+    def forward2(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points):
+        assert len(flame_params["betas"].shape) == 2
+        render_h, render_w = 512, 512
+        query_points = None
+        if self.latent_query_points_type.startswith("e2e_flame"):
+            query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(flame_params,
+                                                                        device=render_w2cs.device)
+        if latent_points.ndim >= 3 and self.num_source_views > 1:
+            avg_points = latent_points.mean(dim=1, keepdim=True)
+            
+            ############### second method #############
+            latent_points = latent_points.float() 
+            weights = self.view_weighting(latent_points) # [B, 2, N, 1]
+            weights = F.softmax(weights, dim=1) # softmax across views per-point
+            aggregated_points = (latent_points * weights).sum(dim=1)
+            latent_points = self.fusion_layer(aggregated_points) + avg_points
+            latent_points = self.layer_norm(latent_points).squeeze(1)
+            
+
+        elif self.num_source_views == 1:
+            latent_points = latent_points.squeeze(1)
+
+        render_results = self.renderer(gs_hidden_features=latent_points,
+                                       query_points=query_points,
+                                       flame_data=flame_params,
+                                       w2c=render_w2cs,
+                                       intrinsic=render_intrs,
+                                       height=render_h,
+                                       width=render_w,
+                                       background_color=render_bg_colors,
+                                       additional_features=None
+        )
+
+        N, M = render_w2cs.shape[:2]
+        assert render_results['comp_rgb'].shape[0] in [N, N], "Batch size mismatch for render_results"
+        assert render_results['comp_rgb'].shape[1] in [M, M*2], "Number of rendered views should be consistent with render_cameras"
+
+        return {
+            # 'latent_points': latent_points,
+            **render_results,
+        }
+        
+    def forward4(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
         assert len(flame_params["betas"].shape) == 2
         render_h, render_w = 512, 512
         query_points = None
@@ -444,38 +603,6 @@ class ModelLAM(nn.Module):
                         K=src_intrs)
             # 2. final per-vertex, per-view weight
             w_raw = front_mask * ray_vis.float()                # [B,V,N]
-            # Geometric Visibility Weighting    
-            # visible_mask   = (w_raw > 0)                       # [B,V,N]
-            # count_visible  = visible_mask.sum(dim=1, keepdim=True)  # [B,1,N]
-
-            # V = w_raw.shape[1]
-            # w_fuse = torch.where(
-            #     (count_visible == 0) | (count_visible == V),
-            #     torch.full_like(w_raw, 1.0 / V),               # 50% - 50%
-            #     visible_mask.float(),                          # 1 / 0
-            # )
-
-            # latent_points = (w_fuse.unsqueeze(-1) * latent_points).sum(dim=1)  # [B,N,D]
-            # ############### first method #############
-            # latent_points = latent_points.permute(0, 2, 1, 3).reshape(latent_points.size(0), latent_points.size(2), -1)
-            # latent_points = latent_points.float() 
-            # latent_points = self.fusion_layer(latent_points)
-            # latent_points += avg_points
-            # latent_points = latent_points.mean(dim=1, keepdim=False)
-            
-            
-            ############### second method #############
-            # latent_points = latent_points.float() 
-            # weights = self.view_weighting(latent_points) # [B, 2, N, 1]
-            # weights = F.softmax(weights, dim=1) # softmax across views per-point
-            # aggregated_points = (latent_points * weights).sum(dim=1)
-            # latent_points = self.fusion_layer(aggregated_points) + avg_points
-            # latent_points = self.layer_norm(latent_points)
-            
-            ############## third method #############
-            # --- Learnable Plücker-based fusion ---------------------------------
-            # latent_points : [B, 2, N, D]
-            # w_raw         : [B, 2, N]            – visibility score (0/1 per ray)
             # Compute Plücker coordinates for each camera-to-point ray            
             cam_pos  = cam_centers.expand(-1, -1, ray_dirs.shape[2], -1)  # [B,2,N,3]
             
@@ -520,66 +647,78 @@ class ModelLAM(nn.Module):
             # 'latent_points': latent_points,
             **render_results,
         }
+    
+    def forward(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
+        return self.forward4(src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats, source_flame_params, render_images, data)
         
     @torch.no_grad()
-    def infer_single_view(self, image, source_c2ws, source_intrs, render_w2cs, 
-                          render_intrs, render_bg_colors, flame_params):
-        # image: [B, N_ref, C_img, H_img, W_img]
-        # source_c2ws: [B, N_ref, 4, 4]
-        # source_intrs: [B, N_ref, 4, 4]
-        # render_c2ws: [B, N_source, 4, 4]
-        # render_intrs: [B, N_source, 4, 4]
-        # render_bg_colors: [B, N_source, 3]
-        # flame_params: Dict, e.g., pose_shape: [B, N_source, 21, 3], betas:[B, 100]
-        assert image.shape[0] == render_w2cs.shape[0], "Batch size mismatch for image and render_c2ws"
-        assert image.shape[0] == render_bg_colors.shape[0], "Batch size mismatch for image and render_bg_colors"
-        assert image.shape[0] == flame_params["betas"].shape[0], "Batch size mismatch for image and flame_params"
-        assert image.shape[0] == flame_params["expr"].shape[0], "Batch size mismatch for image and flame_params"
-        assert len(flame_params["betas"].shape) == 2
-        # render_h, render_w = int(render_intrs[0, 0, 1, 2] * 2), int(render_intrs[0, 0, 0, 2] * 2)
-        render_h, render_w = 512, 512  # for testing
-        assert image.shape[0] == 1
-        num_views = render_w2cs.shape[1]
-        query_points = None
-        
-        if self.latent_query_points_type.startswith("e2e_flame"):
-            query_points, flame_params, _, _ = self.renderer.get_query_points(flame_params,
-                                                                        device=image.device)
-        latent_points, image_feats = self.forward_latent_points(image[:, 0], camera=None, query_points=query_points)  # [B, N, C]
-        image_feats_bchw = rearrange(image_feats, "b (h w) c -> b c h w", h=int(math.sqrt(image_feats.shape[1])))
+    def infer_single_view(
+        self,
+        image=None,
+        source_c2ws=None,
+        source_intrs=None,
+        render_w2cs=None,
+        render_intrs=None,
+        render_bg_colors=None,
+        flame_params=None,
+        latent_points=None,
+    ):
+        """
+        Render a sequence given one or multiple reference views.
 
-        gs_model_list, query_points, flame_params, _ = self.renderer.forward_gs(gs_hidden_features=latent_points,
-                                                query_points=query_points,
-                                                flame_data=flame_params,
-                                                additional_features={"image_feats": image_feats, "image": image[:, 0], "image_feats_bchw": image_feats_bchw})
+        Two modes are supported:
 
-        #TODO save point cloud
-        render_res_list = []
-        for view_idx in range(num_views):
-            render_res = self.renderer.forward_animate_gs(gs_model_list, 
-                                                          query_points,
-                                                          self.renderer.get_single_view_smpl_data(flame_params, view_idx), 
-                                                          render_w2cs[:, view_idx:view_idx+1], 
-                                                          render_intrs[:, view_idx:view_idx+1], 
-                                                          render_h, 
-                                                          render_w, 
-                                                          render_bg_colors[:, view_idx:view_idx+1])
-            render_res_list.append(render_res)
+        1. **End-to-end (default)** – provide `image` with shape
+           ``[B, N_ref, C, H, W]``; the method internally runs the encoder and
+           transformer to obtain latent point tokens.
 
-        out = defaultdict(list)
-        for res in render_res_list:
-            for k, v in res.items():
-                out[k].append(v)
-        for k, v in out.items():
-            # print(f"out key:{k}")
-            if isinstance(v[0], torch.Tensor):
-                out[k] = torch.concat(v, dim=1)
-                if k in ["comp_rgb", "comp_mask", "comp_depth"]:
-                    out[k] = out[k][0].permute(0, 2, 3, 1)  # [1, Nv, 3, H, W] -> [Nv, 3, H, W] - > [Nv, H, W, 3] 
-            else:
-                out[k] = v
-        out['cano_gs_lst'] = gs_model_list
-        return out
+        2. **Renderer-only** – provide pre-computed ``latent_points`` with shape
+           ``[B, N_ref, N_pts, D]`` (e.g. generated by a separate LAM instance
+           that still contained the encoder/transformer).  In this case
+           ``image`` can be ``None`` and the current model may have been
+           constructed with ``instantiate_encoder=False`` and
+           ``instantiate_transformer=False``.
+        """
+
+        # ------------------------------------------------------------------ #
+        # Validate inputs & determine batch dimensions
+        # ------------------------------------------------------------------ #
+        if latent_points is None:
+            assert image is not None, "Either `image` or `latent_points` must be provided."
+            B, N_ref = image.shape[:2]
+        else:
+            B, N_ref = latent_points.shape[:2]
+
+        assert render_w2cs is not None and render_intrs is not None, \
+            "`render_w2cs` and `render_intrs` must be supplied."
+        assert render_w2cs.shape[0] == B, "Batch size mismatch for render_w2cs"
+        assert render_bg_colors.shape[0] == B, "Batch size mismatch for render_bg_colors"
+        assert flame_params["betas"].shape[0] == B, "Batch size mismatch for flame_params"
+        assert flame_params["expr"].shape[0] == B, "Batch size mismatch for flame_params"
+
+        latent_points = latent_points.to(render_w2cs)
+        source_c2ws = source_c2ws.to(render_w2cs)
+        source_intrs = source_intrs.to(render_w2cs)
+
+        # ------------------------------------------------------------------ #
+        # Render using the latent points
+        # ------------------------------------------------------------------ #
+        render_out = self.forward1(
+            src_w2cs=source_c2ws,
+            src_intrs=source_intrs,
+            render_w2cs=render_w2cs,
+            render_intrs=render_intrs,
+            render_bg_colors=render_bg_colors,
+            flame_params=flame_params,
+            latent_points=latent_points,
+        )
+
+        # Convert to HWC for external consumers
+        if "comp_rgb" in render_out and isinstance(render_out["comp_rgb"], torch.Tensor):
+            rgb = render_out["comp_rgb"][0].permute(0, 2, 3, 1)  # [Nv, H, W, 3]
+            render_out["comp_rgb"] = rgb
+
+        return render_out
 
     def save_video(self, video_path, image, flame_params, intrinsics, render_bg_color, fps=1, seconds=4, resolution=(512, 512)):
         from tqdm import tqdm

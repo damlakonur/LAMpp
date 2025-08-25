@@ -1,0 +1,53 @@
+# model_name: ./exps/finetuned_lam_cafca_full_fused_average/lam_1view_overfitting       # folder with model.safetensors
+reference_images:
+  - assets/sample_input/cam_222200036.jpg
+  - assets/sample_input/cam_222200047.jpg     # 2nd reference    
+  # - /home/cafca_dataset/00080/00000_000/masked_images/C12.png
+  # - /home/cafca_dataset/00080/00000_000/masked_images/C15.png
+
+experiment:
+  output_dir: "./exps/inference_mlp_plucker_real_data"
+  checkpoint: "./exps/finetuned_lam_cafca_full_fusion_mlp_plucker/lam_1view_overfitting/checkpoints/epoch=0119-val/total_loss=0.2498.ckpt"
+  motion_seqs_dir: "assets/sample_motion/export/Pen_Pineapple_Apple_Pen/"
+  # model_name: "exps/releases/lam/lam-20k/step_045500/"
+model:
+  transformer_dim: 1024
+  transformer_layers: 10
+  tf_grad_ckpt: true
+  pcl_dim: 1024 
+  encoder_grad_ckpt: true
+  flame_subdivide_num: 1
+  transformer_heads: 16
+  latent_query_points_type: "e2e_flame"
+  encoder_type: "dinov2_fusion"
+  encoder_model_name: "dinov2_vitl14_reg"
+  transformer_type: "sd3_cond"
+  encoder_feat_dim: 1024
+  encoder_freeze: false
+  gs_query_dim: 1024
+  gs_use_rgb: true
+  gs_sh: 3
+  gs_mlp_network_config:
+    activation: "silu"
+    n_hidden_layers: 2
+    n_neurons: 512
+  gs_xyz_offset_max_step: 0.2
+  gs_clip_scaling: 0.01
+  scale_sphere: false
+  shape_param_dim: 10
+  expr_param_dim: 10
+  num_source_views: 2   
+  add_teeth: false
+
+  fix_opacity: false
+  fix_rotation: false
+  instantiate_encoder: true
+  instantiate_transformer: true
+
+  has_disc: false
+
+  teeth_bs_flag: false
+  oral_mesh_flag: false       # keep for ModelLAM construction
+
+training:
+  image_size: 512

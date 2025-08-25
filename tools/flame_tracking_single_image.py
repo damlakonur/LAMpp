@@ -239,7 +239,7 @@ class FlameTrackingSingleImage:
         logger.info(
             f'Finished Processing Image. Time: {end_time - start_time:.2f}s')
 
-        return 0
+        return 0, output_mask_dir
 
     def optimize(self):
         """Optimize the tracking model using configuration data."""

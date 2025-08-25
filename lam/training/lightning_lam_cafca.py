@@ -82,10 +82,6 @@ class LamLightningModel(pl.LightningModule):
                     # param.data.zero_()
                 logger.info("Unfroze parameters of model.fusion_layer.")
                 logger.info(param.data)
-            # if hasattr(model, 'layer_norm') and model.layer_norm is not None:
-            #     for param in model.layer_norm.parameters():
-            #         param.requires_grad = True
-            #     logger.info("Unfroze parameters of model.layer_norm.")
             
             if hasattr(model, 'renderer') and hasattr(model.renderer, 'gs_net') and model.renderer.gs_net is not None:
                 for param in model.renderer.gs_net.parameters():
