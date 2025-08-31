@@ -86,19 +86,6 @@ def _build_model(cfg: DictConfig):
         logger.info("Fine-tuning mode: Freezing all parameters except renderer.mlp_net.")
         for name, param in model.named_parameters():
             param.requires_grad = False
-        
-        if hasattr(model, 'renderer') and hasattr(model.renderer, 'mlp_net') and model.renderer.mlp_net is not None:
-            for param in model.renderer.mlp_net.parameters():
-                param.requires_grad = True
-            logger.info("Unfroze parameters of model.renderer.mlp_net.")
-        # if hasattr(model, 'renderer') and hasattr(model.renderer, 'gs_net') and model.renderer.gs_net is not None:
-        #     for param in model.renderer.gs_net.parameters():
-        #         param.requires_grad = True
-        #     logger.info("Unfroze parameters of model.renderer.gs_net.")
-        else:
-            logger.warning("model.renderer.mlp_net not found or is None. "
-                            "No parameters specifically unfrozen for MLP fine-tuning. "
-                            "Ensure model config `gs_mlp_network_config` is set if MLP is expected.")
     return model
 
 def precompute_and_save_batch(
@@ -125,7 +112,7 @@ def precompute_and_save_batch(
 
     query_points_for_tokens = None
     if model.latent_query_points_type.startswith("e2e_flame"):
-        query_points_for_tokens, _ = model.renderer.get_query_points(
+        query_points_for_tokens, _, _, _ = model.renderer.get_query_points(
             flame_params_for_driving, device=device
         )
 
@@ -203,7 +190,7 @@ def precompute_features_main(cfg: DictConfig):
     logger.info("Feature precomputation finished.")
 
 if __name__ == "__main__":
-    config_path_str = sys.argv[1] if len(sys.argv) > 1 else "configs/training/train_lam_cafca.yaml"
+    config_path_str = sys.argv[1] if len(sys.argv) > 1 else "configs/training/precompute_lam_cafca.yaml"
     cfg = OmegaConf.load(config_path_str)
     cli_overrides = OmegaConf.from_cli(sys.argv[2:])
     cfg = OmegaConf.merge(cfg, cli_overrides)

@@ -459,3 +459,46 @@ def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
         Rotation matrices as tensor of shape (..., 3, 3).
     """
     return quaternion_to_matrix(axis_angle_to_quaternion(axis_angle))
+
+
+# -----------------------------------------------------------------------------
+# Conversion: rotation matrix 3×3  ->  axis-angle (Rodrigues vector)
+# -----------------------------------------------------------------------------
+
+
+def matrix_to_axis_angle(rotation_matrix: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Convert rotation matrices to axis-angle vectors.
+
+    Args:
+        rotation_matrix: tensor of shape (..., 3, 3) containing valid rotation matrices.
+        eps: small value for numerical stability.
+
+    Returns:
+        Axis-angle vectors as tensor of shape (..., 3). The magnitude encodes the
+        rotation angle in radians, the direction encodes the axis.
+    """
+    if rotation_matrix.ndim < 2 or rotation_matrix.shape[-2:] != (3, 3):
+        raise ValueError("rotation_matrix must have shape (..., 3, 3)")
+
+    # Compute the rotation angle from the trace of the matrix
+    trace = rotation_matrix.diagonal(offset=0, dim1=-2, dim2=-1).sum(-1)
+    cos_theta = (trace - 1.0) * 0.5
+    cos_theta_clamped = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
+    theta = torch.acos(cos_theta_clamped)
+
+    # For sin(theta) very small, use first-order approximation to avoid division by zero
+    sin_theta = torch.sin(theta)
+
+    # Compute rotation axis
+    rx = rotation_matrix[..., 2, 1] - rotation_matrix[..., 1, 2]
+    ry = rotation_matrix[..., 0, 2] - rotation_matrix[..., 2, 0]
+    rz = rotation_matrix[..., 1, 0] - rotation_matrix[..., 0, 1]
+    axis = torch.stack((rx, ry, rz), dim=-1)
+
+    # When theta is small, sin(theta) ~ theta, so axis * (theta / (2*sin_theta)) ~ axis/2
+    scale = theta / (2.0 * sin_theta + eps)
+    axis = axis * scale.unsqueeze(-1)
+
+    # Replace any NaNs (from zero-angle) with zeros
+    axis = torch.where(torch.isnan(axis), torch.zeros_like(axis), axis)
+    return axis

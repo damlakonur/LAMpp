@@ -458,7 +458,7 @@ class GS3DRenderer(nn.Module):
             100,
             add_teeth=add_teeth,
             add_shoulder=False,
-            flame_model_path=f'{human_model_path}/flame_assets/flame/flame2023.pkl',
+            flame_model_path=f'{human_model_path}/flame_assets/flame/flame2020.pkl',
             flame_lmk_embedding_path=f"{human_model_path}/flame_assets/flame/landmark_embedding_with_eyes.npy",
             flame_template_mesh_path=f"{human_model_path}/flame_assets/flame/head_template_mesh.obj",
             flame_parts_path=f"{human_model_path}/flame_assets/flame/FLAME_masks.pkl",

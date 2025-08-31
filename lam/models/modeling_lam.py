@@ -91,8 +91,6 @@ class ModelLAM(nn.Module):
         self.encoder_feat_dim = encoder_feat_dim
         self.conf_use_pred_img = False
         self.conf_cat_feat = False and self.conf_use_pred_img  # True # False
-        instantiate_encoder = False
-        instantiate_transformer = False
         self.num_source_views = num_source_views
         self.flame_scale = flame_scale
 
@@ -139,8 +137,8 @@ class ModelLAM(nn.Module):
         # To fuse information from n-views
         if self.num_source_views > 1:
             # initialzie it with zeros
-            # self.layer_norm = nn.LayerNorm(transformer_dim)
-            # self.fusion_layer = nn.Linear(transformer_dim * self.num_source_views, transformer_dim)
+            self.layer_norm = nn.LayerNorm(transformer_dim)
+            self.fusion_layer = nn.Linear(transformer_dim * self.num_source_views, transformer_dim)
             
             # Method 2: Weighting-based fusion
             # hidden_dim = transformer_dim // 4  
@@ -159,12 +157,12 @@ class ModelLAM(nn.Module):
             # New: MLP-based fusion that leverages visibility scores and Plücker
             #      coordinates, followed by a self-attention refinement.
             # ------------------------------------------------------------------ #
-            concat_dim = 2 * (transformer_dim + 6 + 1)  # latent + plücker(6) + vis(1)
-            self.fusion_mlp = nn.Sequential(
-                nn.Linear(concat_dim, transformer_dim),
-                nn.SiLU(),
-                nn.Linear(transformer_dim, transformer_dim),
-            )
+            # concat_dim = 2 * (transformer_dim + 6 + 1)  # latent + plücker(6) + vis(1)
+            # self.fusion_mlp = nn.Sequential(
+            #     nn.Linear(concat_dim, transformer_dim),
+            #     nn.SiLU(),
+            #     nn.Linear(transformer_dim, transformer_dim),
+            # )
         
         # renderer
         self.renderer = GS3DRenderer(human_model_path=human_model_path,
@@ -649,7 +647,7 @@ class ModelLAM(nn.Module):
         }
     
     def forward(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
-        return self.forward4(src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats, source_flame_params, render_images, data)
+        return self.forward1(src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points)
         
     @torch.no_grad()
     def infer_single_view(

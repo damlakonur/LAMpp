@@ -17,5 +17,6 @@ tracking_results/
 *.npz
 *.txt
 *.png
+*.csv
 wandb/*
 lightning_logs/*
