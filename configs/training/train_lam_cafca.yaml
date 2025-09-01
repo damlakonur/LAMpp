@@ -1,6 +1,6 @@
 experiment:
   name: "lam_1view_overfitting"
-  output_dir: "./exps/finetuned_lam_cafca_full_fusion_mlp_plucker"
+  output_dir: "./exps/finetuned_lam_cafca_overfitting_with_different_expressions_same_environment_5k_gaussians"
   model_name: "exps/releases/lam/lam-20k/step_045500/"
   # checkpoint: "/home/dkonur/LAMpp/exps/finetuned_lam_cafca_full_fused_average/lam_1view_overfitting/checkpoints/epoch=0139-val/total_loss=0.2614.ckpt"
 
@@ -23,7 +23,7 @@ model:
   pcl_dim: 1024 
   
   human_model_path: "./model_zoo/human_parametric_models/"
-  flame_subdivide_num: 1
+  flame_subdivide_num: 0
   flame_type: "flame"
   
   gs_query_dim: 1024
@@ -56,28 +56,30 @@ model:
 dataset:
   # cafca_subject_ids_train: [30, 31, 32, 33, 34, 35, 36, 41, 45] #, 34, 35, 36, 41, 45
 # 124, 171, 159, 77, 116, 107, 225, 256, 295, 12
-  cafca_subject_ids_train: [
-    1, 2, 10, 14, 19, 20, 21, 23, 24, 26,
-    39, 44, 54, 56, 57, 59, 60, 63, 64, 65, 66,
-    68, 70, 72, 73, 74, 75, 78, 80, 81, 82, 83, 84, 86, 87, 89, 94, 95,
-    96, 98, 99, 100, 102, 103, 104, 108, 109, 111, 114, 119, 120,
-    129, 132, 133, 138, 139, 147, 148, 151, 152, 153, 154, 157,
-    160, 161, 162, 165, 166, 167, 170, 178, 179, 181, 182, 183, 186,
-    190, 194, 195, 201, 204, 205, 206, 208, 211, 212, 213, 215, 218, 219,
-    220, 221, 224, 227, 228, 230, 232, 233, 234, 235, 236, 238, 239,
-    240, 241, 243, 244, 246, 247, 248, 251, 252, 254, 255, 257, 259,
-    260, 261, 264, 266, 267, 272, 274, 275, 277, 281, 283, 285, 286, 290,
-    291, 293, 294, 296, 297, 298
-  ]
-  cafca_subject_ids_val: [30, 31, 32, 33, 34, 35, 36, 41, 45, 50, 51, 55] #12 -> 48, 49
-  max_tokens_in_ram: 16
+  # cafca_subject_ids_train: [
+  #   1, 2, 10, 14, 19, 20, 21, 23, 24, 26,
+  #   39, 44, 54, 56, 57, 59, 60, 63, 64, 65, 66,
+  #   68, 70, 72, 73, 74, 75, 78, 80, 81, 82, 83, 84, 86, 87, 89, 94, 95,
+  #   96, 98, 99, 100, 102, 103, 104, 108, 109, 111, 114, 119, 120,
+  #   129, 132, 133, 138, 139, 147, 148, 151, 152, 153, 154, 157,
+  #   160, 161, 162, 165, 166, 167, 170, 178, 179, 181, 182, 183, 186,
+  #   190, 194, 195, 201, 204, 205, 206, 208, 211, 212, 213, 215, 218, 219,
+  #   220, 221, 224, 227, 228, 230, 232, 233, 234, 235, 236, 238, 239,
+  #   240, 241, 243, 244, 246, 247, 248, 251, 252, 254, 255, 257, 259,
+  #   260, 261, 264, 266, 267, 272, 274, 275, 277, 281, 283, 285, 286, 290,
+  #   291, 293, 294, 296, 297, 298
+  # ]
+  # cafca_subject_ids_val: [30, 31, 32, 33, 34, 35, 36, 41, 45, 50, 51, 55] #12 -> 48, 49
+  cafca_subject_ids_train: [1196]
+  cafca_subject_ids_val: [1196]
   num_of_src_views: 2
-  num_of_target_views: 4 
+  num_of_target_views: 5
 
 training:
   batch_size: 8
-  num_epochs: 200
-  learning_rate: 1e-4
+  accumulate_grad_batches: 1
+  num_epochs: 1000
+  learning_rate: 4e-4
   device: "cuda"
   save_every_n_epochs: 10
   image_size: 512
@@ -96,7 +98,7 @@ wandb:
   enabled: true
   project: "lam-1-view-finetuning"
   entity: "gr-lampp"
-  run_name: "2-view_136_subjects_fusion_mlp_plucker"
+  run_name: "2-view_1_subject_fusion_averaging_overfitting_with_different_expressions_5k_gaussians"
   log_every_n_steps: 20
   log_train_images_every_n_steps: 10
 

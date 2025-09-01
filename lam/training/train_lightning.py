@@ -47,7 +47,7 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
-from lam.dataset.cafca_lam_dataset import CafcaLamDataset
+from lam.dataset.cafca_lam_de_dataset import CafcaLamDataset
 from lam.training.lightning_lam_cafca import LamLightningModel 
 
 # Local get_logger definition for this script
@@ -97,8 +97,7 @@ def train(cfg: DictConfig):
         num_source_frames=cfg.dataset.num_of_src_views,
         num_driving_frames=cfg.dataset.num_of_target_views,
         image_size=cfg.training.image_size,
-        is_val=False,
-        max_tokens_in_ram= cfg.dataset.get("max_tokens_in_ram", None)
+        is_val=False
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -121,7 +120,6 @@ def train(cfg: DictConfig):
             num_driving_frames=cfg.dataset.num_of_target_views,
             image_size=cfg.training.image_size,
             is_val=True,
-            max_tokens_in_ram= cfg.dataset.get("max_tokens_in_ram", None)
         )
         val_dataloader = DataLoader(
             val_dataset,
@@ -169,6 +167,7 @@ def train(cfg: DictConfig):
         accelerator=cfg.training.device, 
         precision=cfg.training.get("precision", "16-mixed"), 
         check_val_every_n_epoch=cfg.training.get("validate_every_n_epochs", 1.0),
+        accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 1),
         # profiler= profiler if cfg.profiler.get("is_enabled") else None,
     )
 

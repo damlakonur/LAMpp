@@ -24,40 +24,33 @@ logger = get_train_logger(__name__)
 
 def prepare_batch_for_model(batch_from_dataloader, device):
     """
-    Prepares a batch of data from CafcaLamDataset (already batched by DataLoader)
-    for input to ModelLAM. Moves tensors to device and structures them as expected by the model.
-    Casts image-related tensors to float32 to avoid dtype issues in torch.compile.
+    Prepares a batch of data from CafcaDatasetPP (already batched by DataLoader)
+    for input to the feature precomputation model.
     """
     def _move(x, dtype=None):
-        """Pinned-memory -> GPU async copy; optional fused cast."""
         if torch.is_tensor(x):
             return x.to(device=device, dtype=dtype or x.dtype, non_blocking=True)
         return x 
 
-    # # Source data for encoding
-    prepared_batch = {}
-    prepared_batch["image"] = _move(batch_from_dataloader["source_rgbs"])
+    prepared_batch = {
+        "image": _move(batch_from_dataloader["source_rgbs"]),
+        "env_id": _move(batch_from_dataloader["env_id"]),
+        "expr_id": _move(batch_from_dataloader["expr_id"]),
+    }
 
-
-    # FLAME parameters
     flame_params_for_model = {}
-    flame_keys_base = ["expr", "rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation"]
+    flame_keys = ["expr", "rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation", "betas", "canon_2_cam"]
 
-    betas = batch_from_dataloader["betas"]
-    if betas.ndim == 3:  # [B, N_render, D]
-        betas = betas[:, 0, :]
-    flame_params_for_model["betas"] = betas.to(device).float()  # [B, D]
-
-    for key in flame_keys_base:
+    for key in flame_keys:
         if key in batch_from_dataloader:
-            flame_params_for_model[key] = batch_from_dataloader[key].to(device).float()
+            param = batch_from_dataloader[key]
+            # Ensure param is [B, D] by squeezing the middle dimension if it's [B, 1, D]
+            if param.ndim == 3 and param.shape[1] == 1:
+                param = param.squeeze(1)
+            flame_params_for_model[key] = param.to(device).float()
 
     prepared_batch["flame_params"] = flame_params_for_model
-
-    # Optional UID
-    if "uid" in batch_from_dataloader:
-        prepared_batch["uid"] = batch_from_dataloader["uid"]
-
+    
     return prepared_batch
 
 def _build_model(cfg: DictConfig):
@@ -134,7 +127,9 @@ def precompute_and_save_batch(
         current_sample_subject_output_dir = (
             Path(env_paths.DATA_DIR)
             / subject_id_str_sample
-            / f"{env_paths.EXPRESSION_ID}_{env_paths.ENVIRONMENT_ID}"
+            / f"env_{batch_data_from_loader['env_id'][i]}"
+            / f"expr_{batch_data_from_loader['expr_id'][i]}"
+            / "frames"
         )
 
         # image_feats_target_dir = current_sample_subject_output_dir / "image_feats"
@@ -167,7 +162,6 @@ def precompute_features_main(cfg: DictConfig):
     dataset = CafcaDatasetPP(
         subject_list=list(cfg.dataset.cafca_subject_ids_train),
         num_source_frames=cfg.dataset.num_of_src_views,
-        num_driving_frames=cfg.dataset.num_of_target_views,
         image_size=cfg.training.image_size,
         is_val=False
     )
