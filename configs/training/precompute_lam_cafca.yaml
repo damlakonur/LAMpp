@@ -23,7 +23,7 @@ model:
   pcl_dim: 1024 
   
   human_model_path: "./model_zoo/human_parametric_models/"
-  flame_subdivide_num: 1
+  flame_subdivide_num: 0
   flame_type: "flame"
   
   gs_query_dim: 1024
@@ -41,6 +41,7 @@ model:
   
   fix_opacity: false
   fix_rotation: false
+  num_gaussians_per_vertex: 1
   flame_scale: 1.0
   
   add_teeth: false

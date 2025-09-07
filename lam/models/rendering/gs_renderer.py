@@ -432,6 +432,7 @@ class GS3DRenderer(nn.Module):
                  add_teeth=True,
                  teeth_bs_flag=False,
                  oral_mesh_flag=False,
+                 num_gaussians_per_vertex=1,
                  **kwargs,
                  ):
         super().__init__()
@@ -444,7 +445,8 @@ class GS3DRenderer(nn.Module):
         self.teeth_bs_flag = teeth_bs_flag
         self.oral_mesh_flag = oral_mesh_flag
         self.render_rgb = kwargs.get("render_rgb", True)
-        print("==="*16*3, "\n Render rgb:", self.render_rgb, "\n"+"==="*16*3)
+        self.num_gaussians_per_vertex = num_gaussians_per_vertex
+        print("==="*16*3, f"\n Render rgb: {self.render_rgb}, Gaussians per vertex: {self.num_gaussians_per_vertex} \n"+"==="*16*3)
         
         self.scaling_modifier = 1.0
         self.sh_degree = sh_degree
@@ -472,9 +474,24 @@ class GS3DRenderer(nn.Module):
 
         self.mlp_network_config = mlp_network_config
         if self.mlp_network_config is not None:
-            self.mlp_net = MLP(query_dim, query_dim, **self.mlp_network_config)
+            if num_gaussians_per_vertex == 1:
+                # Single MLP
+                self.mlp_net = MLP(query_dim, query_dim, **self.mlp_network_config)
+            else:
+                # Multiple MLPs with perturbation - this is where the real learned features are processed!
+                self.mlp_nets = nn.ModuleList()
+                
+                # First MLP: original (preserves learned weights)
+                base_mlp = MLP(query_dim, query_dim, **self.mlp_network_config)
+                self.mlp_nets.append(base_mlp)
+                
+                # Additional MLPs: perturbed copies
+                for i in range(1, num_gaussians_per_vertex):
+                    perturbed_mlp = self._create_perturbed_mlp(base_mlp)
+                    self.mlp_nets.append(perturbed_mlp)
 
         init_scaling = -5.0
+        # Single gs_net - same for all gaussians (just converts features to attributes)
         self.gs_net = GSLayer(in_channels=query_dim,
                               use_rgb=use_rgb,
                               sh_degree=self.sh_degree,
@@ -489,6 +506,22 @@ class GS3DRenderer(nn.Module):
                               fix_rotation=fix_rotation,
                               use_fine_feat=True if decode_with_extra_info is not None and decode_with_extra_info["type"] is not None else False,
                               )
+
+    def _create_perturbed_mlp(self, base_mlp):
+        """Create a perturbed copy of the MLP with small weight variations"""
+        import copy
+        perturbed_mlp = copy.deepcopy(base_mlp)
+        
+        # Small perturbations to MLP weights
+        noise_scale = 0.005
+        
+        with torch.no_grad():
+            for name, param in perturbed_mlp.named_parameters():
+                if 'weight' in name or 'bias' in name:
+                    noise = torch.randn_like(param) * noise_scale
+                    param.add_(noise)
+        
+        return perturbed_mlp
         
     def forward_single_view(self,
         gs: GaussianModel,
@@ -574,9 +607,15 @@ class GS3DRenderer(nn.Module):
             
     def animate_gs_model(self, gs_attr: GaussianModel, query_points, flame_data, debug=False):
         """
-        query_points: [N, 3]
+        query_points: [V, 3] - FLAME vertex positions
+        gs_attr.xyz: [V*K, 3] if multiple gaussians, [V, 3] if single
         """
         device = gs_attr.xyz.device
+        
+        # Check if we have multiplied gaussians
+        num_gaussians_per_vertex = getattr(gs_attr, 'num_gaussians_per_vertex', 1)
+        V = query_points.shape[0]  # Number of FLAME vertices
+        
         if debug:
             N = gs_attr.xyz.shape[0]
             gs_attr.xyz = torch.ones_like(gs_attr.xyz) * 0.0
@@ -586,47 +625,97 @@ class GS3DRenderer(nn.Module):
 
             gs_attr.opacity = opacity
             gs_attr.rotation = rotation
-            # gs_attr.scaling = torch.ones_like(gs_attr.scaling) * 0.05
-            # print(gs_attr.shs.shape)
+
+        # Original behavior when num_gaussians_per_vertex == 1
+        if num_gaussians_per_vertex == 1:
+            with torch.autocast(device_type=device.type, dtype=torch.float32):
+                mean_3d = gs_attr.xyz  # [V, 3]
+                
+                num_view = flame_data["expr"].shape[0]  # [Nv, 100]
+                mean_3d = mean_3d.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, V, 3]
+                query_points = query_points.unsqueeze(0).repeat(num_view, 1, 1)
+
+                if self.teeth_bs_flag:
+                    expr = torch.cat([flame_data['expr'], flame_data['teeth_bs']], dim=-1)
+                else:
+                    expr = flame_data["expr"]
+                ret = self.flame_model.animation_forward(v_cano=mean_3d,
+                                                    shape=flame_data["betas"].repeat(num_view, 1),
+                                                    expr=expr,
+                                                    rotation=flame_data["rotation"],
+                                                    neck=flame_data["neck_pose"],
+                                                    jaw=flame_data["jaw_pose"],
+                                                    eyes=flame_data["eyes_pose"],
+                                                    translation=flame_data["translation"],
+                                                    zero_centered_at_root_node=False,
+                                                    return_landmarks=False,
+                                                    return_verts_cano=False,
+                                                    static_offset=None,
+                                                    )
+                mean_3d = ret["animated"]
+                
+            gs_attr_list = []                                                                  
+            for i in range(num_view):
+                gs_attr_copy = GaussianModel(xyz=mean_3d[i],
+                                        opacity=gs_attr.opacity, 
+                                        rotation=gs_attr.rotation, 
+                                        scaling=gs_attr.scaling,
+                                        shs=gs_attr.shs,
+                                        offset=gs_attr.offset)
+                gs_attr_list.append(gs_attr_copy)
+            
+            return gs_attr_list
+        
+        # Multi-gaussian behavior when > 1
+        # We have V*K gaussians, need to map them back to V FLAME vertices
+        all_gaussian_positions = gs_attr.xyz.view(V, num_gaussians_per_vertex, 3)  # [V, K, 3]
+        
+        # Calculate offsets from each gaussian to its parent FLAME vertex
+        flame_vertices_expanded = query_points.unsqueeze(1).repeat(1, num_gaussians_per_vertex, 1)  # [V, K, 3]
+        local_offsets = all_gaussian_positions - flame_vertices_expanded  # [V, K, 3]
 
         with torch.autocast(device_type=device.type, dtype=torch.float32):
-            # mean_3d = query_points + gs_attr.xyz  # [N, 3]
-            mean_3d = gs_attr.xyz  # [N, 3]
+            num_view = flame_data["expr"].shape[0]
             
-            num_view = flame_data["expr"].shape[0]  # [Nv, 100]
-            mean_3d = mean_3d.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, N, 3]
-            query_points = query_points.unsqueeze(0).repeat(num_view, 1, 1)
-
+            # Animate FLAME vertices
+            flame_vertices_anim = query_points.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, V, 3]
+            
             if self.teeth_bs_flag:
                 expr = torch.cat([flame_data['expr'], flame_data['teeth_bs']], dim=-1)
             else:
                 expr = flame_data["expr"]
-            # Bottleneck: FLAME forward
-            # with torch.autograd.profiler.record_function("flame_animation_forward"):
-            ret = self.flame_model.animation_forward(v_cano=mean_3d,
-                                                shape=flame_data["betas"].repeat(num_view, 1),
-                                                expr=expr,
-                                                rotation=flame_data["rotation"],
-                                                neck=flame_data["neck_pose"],
-                                                jaw=flame_data["jaw_pose"],
-                                                eyes=flame_data["eyes_pose"],
-                                                translation=flame_data["translation"],
-                                                zero_centered_at_root_node=False,
-                                                return_landmarks=False,
-                                                return_verts_cano=False,
-                                                # static_offset=flame_data['static_offset'].to('cuda'),
-                                                static_offset=None,
-                                                )
-            mean_3d = ret["animated"]
-            
-        gs_attr_list = []                                                                  
+                
+            ret = self.flame_model.animation_forward(
+                v_cano=flame_vertices_anim,  # Only FLAME vertices! [Nv, V, 3]
+                shape=flame_data["betas"].repeat(num_view, 1),
+                expr=expr,
+                rotation=flame_data["rotation"],
+                neck=flame_data["neck_pose"],
+                jaw=flame_data["jaw_pose"],
+                eyes=flame_data["eyes_pose"],
+                translation=flame_data["translation"],
+                zero_centered_at_root_node=False,
+                return_landmarks=False,
+                return_verts_cano=False,
+                static_offset=None,
+            )
+            animated_flame_vertices = ret["animated"]  # [Nv, V, 3]
+        
+        gs_attr_list = []
         for i in range(num_view):
-            gs_attr_copy = GaussianModel(xyz=mean_3d[i],
-                                    opacity=gs_attr.opacity, 
-                                    rotation=gs_attr.rotation, 
-                                    scaling=gs_attr.scaling,
-                                    shs=gs_attr.shs,
-                                    offset=gs_attr.offset) # [N, 3]
+            # Apply FLAME animation + local offsets to get all gaussian positions
+            animated_flame_curr = animated_flame_vertices[i].unsqueeze(1).repeat(1, num_gaussians_per_vertex, 1)  # [V, K, 3]
+            final_gaussian_positions = animated_flame_curr + local_offsets  # [V, K, 3]
+            final_positions_flat = final_gaussian_positions.view(-1, 3)  # [V*K, 3]
+                
+            gs_attr_copy = GaussianModel(
+                xyz=final_positions_flat,
+                opacity=gs_attr.opacity, 
+                rotation=gs_attr.rotation, 
+                scaling=gs_attr.scaling,
+                shs=gs_attr.shs,
+                offset=gs_attr.offset
+            )
             gs_attr_list.append(gs_attr_copy)
         
         return gs_attr_list
@@ -634,16 +723,46 @@ class GS3DRenderer(nn.Module):
     
     def forward_gs_attr(self, x, query_points, flame_data, debug=False, x_fine=None, vtx_sym_idxs=None):
         """
-        x: [N, C] Float[Tensor, "Np Cp"],
-        query_points: [N, 3] Float[Tensor, "Np 3"]        
+        x: [V, C] - latent features from cross-attention 
+        query_points: [V, 3] - FLAME vertex positions
         """
         device = x.device
-        if self.mlp_network_config is not None:
-            x = self.mlp_net(x)
-            if x_fine is not None:
-                x_fine = self.mlp_net(x_fine)
-        gs_attr: GaussianModel = self.gs_net(x, query_points, x_fine, vtx_sym_idxs=vtx_sym_idxs)
-        return gs_attr
+        
+        # Original behavior when num_gaussians_per_vertex == 1
+        if self.num_gaussians_per_vertex == 1:
+            if self.mlp_network_config is not None:
+                x = self.mlp_net(x)
+                if x_fine is not None:
+                    x_fine = self.mlp_net(x_fine)
+            gs_attr = self.gs_net(x, query_points, x_fine, vtx_sym_idxs=vtx_sym_idxs)
+            return gs_attr
+        
+        # Multi-gaussian behavior: different MLPs process same input → different features → different gaussians
+        all_gs_attrs = []
+        
+        for i in range(self.num_gaussians_per_vertex):
+            # Process features with i-th MLP
+            if self.mlp_network_config is not None:
+                x_processed = self.mlp_nets[i](x)  # Different MLP = different processing
+                x_fine_processed = self.mlp_nets[i](x_fine) if x_fine is not None else None
+            else:
+                x_processed = x
+                x_fine_processed = x_fine
+            
+            # Same gs_net converts different input features to different gaussian attributes
+            gs_attr_i = self.gs_net(x_processed, query_points, x_fine_processed, vtx_sym_idxs=vtx_sym_idxs)
+            all_gs_attrs.append(gs_attr_i)
+        
+        # Concatenate all gaussians
+        combined_attrs = {}
+        for attr_name in ['xyz', 'opacity', 'rotation', 'scaling', 'shs', 'offset']:
+            if hasattr(all_gs_attrs[0], attr_name) and getattr(all_gs_attrs[0], attr_name) is not None:
+                combined_attrs[attr_name] = torch.cat([getattr(gs, attr_name) for gs in all_gs_attrs], dim=0)
+            else:
+                combined_attrs[attr_name] = None
+        combined_gs = GaussianModel(**combined_attrs)
+        combined_gs.num_gaussians_per_vertex = self.num_gaussians_per_vertex
+        return combined_gs
             
 
     def get_query_points(self, flame_data, device):

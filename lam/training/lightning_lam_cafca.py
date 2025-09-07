@@ -72,10 +72,19 @@ class LamLightningModel(pl.LightningModule):
             for name, param in model.named_parameters():
                 param.requires_grad = False
             
-            if hasattr(model, 'renderer') and hasattr(model.renderer, 'mlp_net') and model.renderer.mlp_net is not None:
-                for param in model.renderer.mlp_net.parameters():
-                    param.requires_grad = True
-                logger.info("Unfroze parameters of model.renderer.mlp_net.")
+            # Handle both single and multiple MLPs
+            if hasattr(model, 'renderer'):
+                if hasattr(model.renderer, 'mlp_net') and model.renderer.mlp_net is not None:
+                    # Single MLP case (num_gaussians_per_vertex == 1)
+                    for param in model.renderer.mlp_net.parameters():
+                        param.requires_grad = True
+                    logger.info("Unfroze parameters of model.renderer.mlp_net.")
+                elif hasattr(model.renderer, 'mlp_nets') and model.renderer.mlp_nets is not None:
+                    # Multiple MLPs case (num_gaussians_per_vertex > 1)
+                    for i, mlp_net in enumerate(model.renderer.mlp_nets):
+                        for param in mlp_net.parameters():
+                            param.requires_grad = True
+                        logger.info(f"Unfroze parameters of model.renderer.mlp_nets[{i}].")
             if hasattr(model, 'fusion_layer') and model.fusion_layer is not None:
                 for param in model.fusion_layer.parameters():
                     param.requires_grad = True

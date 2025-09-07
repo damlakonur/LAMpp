@@ -1,6 +1,6 @@
 experiment:
   name: "lam_1view_overfitting"
-  output_dir: "./exps/finetuned_lam_cafca_overfitting_with_different_expressions_same_environment_5k_gaussians"
+  output_dir: "./exps/finetuned_lam_cafca_overfitting_with_different_expressions_same_environment_5k_gaussians_duplication_wmlpNet_4"
   model_name: "exps/releases/lam/lam-20k/step_045500/"
   # checkpoint: "/home/dkonur/LAMpp/exps/finetuned_lam_cafca_full_fused_average/lam_1view_overfitting/checkpoints/epoch=0139-val/total_loss=0.2614.ckpt"
 
@@ -41,6 +41,7 @@ model:
   
   fix_opacity: false
   fix_rotation: false
+  num_gaussians_per_vertex: 4
   flame_scale: 1.0
   
   add_teeth: false
@@ -98,7 +99,7 @@ wandb:
   enabled: true
   project: "lam-1-view-finetuning"
   entity: "gr-lampp"
-  run_name: "2-view_1_subject_fusion_averaging_overfitting_with_different_expressions_5k_gaussians"
+  run_name: "2-view_1_subject_fusion_averaging_overfitting_with_different_expressions_5k_gaussians_duplication_wmlpNet_4"
   log_every_n_steps: 20
   log_train_images_every_n_steps: 10
 

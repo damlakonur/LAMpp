@@ -81,6 +81,7 @@ class ModelLAM(nn.Module):
                  flame_scale=1.0,
                  instantiate_encoder=False,
                  instantiate_transformer=False,
+                 num_gaussians_per_vertex=1,
                  **kwargs,
                  ):
         super().__init__()
@@ -188,6 +189,7 @@ class ModelLAM(nn.Module):
                                      oral_mesh_flag=kwargs.get("oral_mesh_flag", False),
                                      use_mesh_shading=kwargs.get('use_mesh_shading', False),
                                      render_rgb=kwargs.get("render_rgb", True),
+                                     num_gaussians_per_vertex=num_gaussians_per_vertex,
                                      )
 
     def get_last_layer(self):
