@@ -42,7 +42,6 @@ The model introduce fusion_mlp to process two input images simultaneously, combi
 
 - **Training**: `configs/training/train_lam_cafca.yaml`
 - **Inference**: `configs/inference/inference_lam_cafca.yaml`
-- **Two-View Example**: `configs/inference/two_view.yaml`
 
 ---
 
