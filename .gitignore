@@ -16,11 +16,13 @@ tracking_results/
 *.npy
 *.npz
 *.txt
-*.png
 *.csv
 wandb/*
 lightning_logs/*
 debug_vis/*
 *.mp4
-*.jpg
+images/*
 *.zip
+assests/*
+docs/MVLAM.key
+*.key

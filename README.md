@@ -1,3 +1,50 @@
+
+
+## MV-LAM: Multi-View Fusion for 3D-Complete Head Avatars with CAFCA Dataset
+
+This repository contains a finetuned version of LAM that extends the original single-view model to support **2-view input** using the CAFCA dataset.
+
+### Overview
+
+The original LAM model creates 3D avatars from a single reference image. This finetuned version makes the model compatible with **two reference images** from different viewpoints. By leveraging multi-view information, the model achieves improved **3D completeness** and **3D consistency** compared to single-view reconstruction.
+
+<p align="center">
+  <img src="./assets/mv_lam_method-9.png" width="80%">
+</p>
+
+### Method
+
+The model introduce fusion_mlp to process two input images simultaneously, combining their features to generate more complete and consistent 3D avatars. The key configuration changes include:
+- `num_source_views: 2` - Model expects 2 input images
+- Custom CAFCA dataset integration for training and inference
+
+### Results
+
+**Input Images** (two reference views):
+
+<div align="center">
+  <img src="./assets/C02.jpg" width="45%" style="margin-right: 2%;">
+  <img src="./assets/C14.jpg" width="45%">
+</div>
+
+**Output Video** (comparison showing improved reconstruction quality with 2-view input):
+
+<div align="center">
+  <video controls src="./output_99.mp4" width="80%">
+  </video>
+</div>
+
+
+### Configuration Files
+
+- **Training**: `configs/training/train_lam_cafca.yaml`
+- **Inference**: `configs/inference/inference_lam_cafca.yaml`
+- **Two-View Example**: `configs/inference/two_view.yaml`
+
+---
+
+
+
 # LAM: Official Pytorch Implementation
 
 <p align="center">
