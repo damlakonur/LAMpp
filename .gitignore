@@ -20,3 +20,7 @@ tracking_results/
 *.csv
 wandb/*
 lightning_logs/*
+debug_vis/*
+*.mp4
+*.jpg
+*.zip

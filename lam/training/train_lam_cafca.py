@@ -50,6 +50,7 @@ def prepare_batch_for_model(batch, device):
     prepared = {
         "image": _move(batch["source_rgbs"]),
         "latent_points": _move(batch["tokens"]),
+        # "source_img_feats": _move(batch["source_img_feats"]),
     }
     prepared["src_w2cs"] = _move(batch["source_w2cs"])
     prepared["src_intrs"] = _move(batch["source_intrs"])
@@ -57,8 +58,8 @@ def prepare_batch_for_model(batch, device):
     prepared["render_intrs"]  = _move(batch["driving_intrs"])
     prepared["render_bg_colors"] = _move(batch["render_bg_colors"])
 
-    if "driving_masks" in batch:
-        prepared["driving_masks"] = _move(batch["driving_masks"])
+
+    prepared["driving_masks"] = _move(batch["driving_masks"])
 
     prepared["gt_render_images"] = _move(batch["driving_image"])
     flame = {}
@@ -66,6 +67,7 @@ def prepare_batch_for_model(batch, device):
     if betas.ndim == 3:
         betas = betas[:, 0]
     flame["betas"] = _move(betas, torch.float32)
+    prepared["source_canon_2_cam"] = _move(batch["source_canon_2_cam"], torch.float32)
 
     for k in ["expr", "rotation", "neck_pose", "jaw_pose", "eyes_pose", "translation"]:
         if k in batch:
@@ -75,6 +77,7 @@ def prepare_batch_for_model(batch, device):
     if "uid" in batch:
         prepared["uid"] = batch["uid"] 
     prepared["source_cam_ids_list_scalar"] = batch["source_cam_ids_list_scalar"]
+
 
     return prepared
 

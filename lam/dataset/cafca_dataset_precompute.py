@@ -88,10 +88,10 @@ class CafcaDatasetPP(Dataset):
                 for expr_dir in expr_dirs:
                     metadata_path = expr_dir / "metadata.json"
                     flame_params_path = expr_dir / "00400.frame"
-                    cameras_dir = expr_dir / "cameras_json"
+                    cameras_dir = expr_dir / "cameras_json"  # Use processed cameras
                     
                     frames_dir = expr_dir / "frames"
-                    masked_images_dir = frames_dir / "masked_image"
+                    cropped_images_dir = frames_dir / "cropped_images"  # Use processed images
                     masks_dir = frames_dir / "foreground_mask"
                     
                     if not metadata_path.exists():
@@ -104,7 +104,7 @@ class CafcaDatasetPP(Dataset):
                     expr_id = metadata.get("expr_id", "")
 
                     if not flame_params_path.exists() or not cameras_dir.exists() or \
-                       not masked_images_dir.exists() or not masks_dir.exists():
+                       not cropped_images_dir.exists() or not masks_dir.exists():
                         continue
                     
                     camera_files = sorted(list(cameras_dir.glob("*.json")))
@@ -114,7 +114,7 @@ class CafcaDatasetPP(Dataset):
                     for cam_json_file in camera_files:
                         cam_id = cam_json_file.stem
                         
-                        image_file = masked_images_dir / f"{cam_id}.jpg"
+                        image_file = cropped_images_dir / f"{cam_id}.jpg"
                         mask_file = masks_dir / f"{cam_id}.png"
                         
                         if not image_file.exists() or not mask_file.exists():
@@ -196,17 +196,21 @@ class CafcaDatasetPP(Dataset):
         source_images_list, source_cam_ids_list, source_mask_list = [], [], []
         for s_idx in source_frame_indices:
             meta = subject_frames_info[s_idx]
+            # Load processed images (already enlarged to focus on head at 512x512)
             rgb_img = np.array(Image.open(meta["image_file_path"]))
             mask_img = np.array(Image.open(meta["mask_file_path"]))
 
-            rgb_tensor, mask_tensor = preprocess_image(
-                rgb_img, mask_img, pad_ratio=0,
-                bg_color=np.array([1.0, 1.0, 1.0]),
-                aspect_standard=1.0, enlarge_ratio=[1.0, 1.0],
-                render_tgt_size=512, multiply=14, need_mask=True
-            )
-            source_images_list.append(rgb_tensor.squeeze(0))
-            source_mask_list.append(mask_tensor.squeeze(0))
+            # Simply resize to 504x504 to be divisible by 14 (DINOv2 patch size)
+            # 512 % 14 != 0, but 504 % 14 = 0 (504 = 36 * 14)
+            rgb_resized = cv2.resize(rgb_img, (504, 504), interpolation=cv2.INTER_AREA)
+            mask_resized = cv2.resize(mask_img, (504, 504), interpolation=cv2.INTER_AREA)
+            
+            # Normalize to [0, 1] range
+            rgb_tensor = torch.from_numpy(rgb_resized).float().permute(2, 0, 1) / 255.0  # [3, 504, 504]
+            mask_tensor = torch.from_numpy(mask_resized).float().unsqueeze(0) / 255.0  # [1, 504, 504]
+            
+            source_images_list.append(rgb_tensor)
+            source_mask_list.append(mask_tensor)
             source_cam_ids_list.append(meta["cam_id"])
 
 

@@ -17,8 +17,12 @@ import torch
 import torchvision
 import tyro
 import yaml
+import pyvista as pv
 from loguru import logger
 from PIL import Image
+from dreifus.pyvista import render_from_camera
+from dreifus.camera import CameraCoordinateConvention, PoseType
+from dreifus.matrix import Intrinsics, Pose
 
 # --- Configuration for Preprocessing ---
 CROP_PADDING_SCALE = 1.65  # From FlameTrackingSingleImage.preprocess expand_bbox scale
@@ -41,24 +45,12 @@ class CafcaDataset(Dataset):
                                              detect_iris_landmarks=True,
                                              args = self.cfg)
 
-        for subject_int in subject_list: # Iterate using the int subject ID
+        for subject_int in subject_list:
             subject_str_zfill = str(subject_int).zfill(5)
             subject_dir_actual = self.get_subject_dir(subject_int)
             
             cameras_dir = subject_dir_actual / "cameras_json"
             images_dir = subject_dir_actual / "masked_images"
-            flame_params_path = os.path.join(
-                subject_dir_actual, f"{str(subject_int).zfill(5)}_1stage_tracked_flame_params.npz"
-            )
-            flame_params = np.load(flame_params_path)
-            R = flame_params["rotation"]
-            R_axis_angle = R.astype(np.float32)  # shape: (1, 3)
-            R_matrix, _ = cv2.Rodrigues(R_axis_angle[0])
-            t = flame_params["translation"]
-            mesh_pose = np.eye(4)
-            mesh_pose[:3, :3] = R_matrix
-            mesh_pose[:3, 3] = t
-            mesh_pose_inv = np.linalg.inv(mesh_pose)
             
             camera_files = sorted(list(cameras_dir.glob("*.json")))
             image_files = sorted(list(images_dir.glob("*.png")))
@@ -76,8 +68,6 @@ class CafcaDataset(Dataset):
                     f"Mismatch between cameras ({len(camera_files)}) and images ({len(image_files)}) for subject {subject_int}"
                 )
 
-
-
             for cam_file, img_file in zip(camera_files, image_files):
                 # Your original camera_id logic
                 camera_id = cam_file.stem.split(".")[-1] 
@@ -93,21 +83,17 @@ class CafcaDataset(Dataset):
                         raise KeyError(f"'cam2world' key not found in {cam_file}")
                     if "K" not in cam_params:
                         raise KeyError(f"'K' key not found in {cam_file}")
-                    new_c2w = np.array(cam_params["cam2world"])
-                    new_c2w = mesh_pose_inv @ new_c2w
-                    new_w2c = np.array(cam_params["world2cam"])
-                    new_w2c = mesh_pose_inv @ new_w2c
 
                     self.data.append(
                         {
-                            "subject": subject_int, # Storing the int subject ID
-                            "subject_id_str": subject_str_zfill, # For convenience if needed
-                            "cam_2_world": new_c2w,
+                            "subject": subject_int,
+                            "subject_id_str": subject_str_zfill,
+                            "cam_2_world": cam_params["cam2world"],
                             "intrinsic": np.array(cam_params["K"]),
                             "image_file_path": str(img_file), # Path to image in "masked_images"
                             "cam_id": camera_id,
                             "original_cam_json_path": str(cam_file),
-                            "world_2_cam": new_w2c
+                            "world_2_cam": cam_params["world2cam"]
                         }
                     )
                 except Exception as e:
@@ -292,6 +278,7 @@ if __name__ == "__main__":
         exit()
         
     dataset_instance = CafcaDataset([30])
+    breakpoint()
 
     if len(dataset_instance) == 0:
         print("CafcaDataset is empty. Please check paths and subject list in env_paths.py. Exiting.")
@@ -343,17 +330,18 @@ if __name__ == "__main__":
                 original_k_np 
             )
             image_save_path = output_processed_images_dir / f"{cam_id}.png"
-            cv2.imwrite(str(image_save_path), processed_img_np)
-            # Image.fromarray(processed_img_np).save(output_processed_images_dir / f"{cam_id}.png")
+            # cv2.imwrite(str(image_save_path), original_image_pil)
+            # Image.fromarray(original_image_np).save(image_save_path)
+            Image.fromarray(processed_img_np).save(output_processed_images_dir / f"{cam_id}.png")
             Image.fromarray(processed_mask_np, mode='L').save(output_processed_masks_dir / f"{cam_id}.png")
 
             with open(Path(original_cam_json_path_str), 'r') as f_orig_cam:
                 original_full_cam_params = json.load(f_orig_cam)
 
             new_cam_params_to_save = original_full_cam_params.copy() 
-            new_cam_params_to_save["K"] = adjusted_k_np.tolist()
-            new_cam_params_to_save["cam2world"] = item_data["cam_2_world"].tolist()
-            new_cam_params_to_save["world2cam"] = item_data["world_2_cam"].tolist()
+            new_cam_params_to_save["K"] = original_k_np.tolist()
+            new_cam_params_to_save["cam2world"] = item_data["cam_2_world"]
+            new_cam_params_to_save["world2cam"] = item_data["world_2_cam"]
             new_cam_params_to_save["height"] = processed_img_np.shape[0] 
             new_cam_params_to_save["width"] = processed_img_np.shape[1]  
             new_cam_params_to_save["original_height_before_stage1"] = original_image_np.shape[0]

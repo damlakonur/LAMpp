@@ -21,9 +21,10 @@ from __future__ import division
 import torch
 import torch.nn.functional as F
 from torch.autograd.profiler import record_function
+from typing import List
 
 
-def batch_rodrigues(rot_vecs, epsilon=1e-8, dtype=torch.float32):
+def batch_rodrigues(rot_vecs: torch.Tensor, dtype: torch.dtype=torch.float32):
     """Calculates the rotation matrices for a batch of rotation vectors
     Parameters
     ----------
@@ -250,10 +251,10 @@ def transform_mat(R, t):
         - T: Bx4x4 Transformation matrix
     """
     # No padding left or right, only add an extra row
-    return torch.cat([F.pad(R, [0, 0, 0, 1]), F.pad(t, [0, 0, 0, 1], value=1)], dim=2)
+    return torch.cat([F.pad(R, [0, 0, 0, 1]), F.pad(t, [0, 0, 0, 1], value=1.0)], dim=2)
 
 
-def batch_rigid_transform(rot_mats, joints, parents_list_cpu, parents, dtype=torch.float32):
+def batch_rigid_transform(rot_mats: torch.Tensor, joints: torch.Tensor, parents_list_cpu: List[int], parents: torch.Tensor, dtype: torch.dtype=torch.float32):
     """
     Applies a batch of rigid transformations to the joints
 
@@ -276,7 +277,6 @@ def batch_rigid_transform(rot_mats, joints, parents_list_cpu, parents, dtype=tor
         The relative (with respect to the root joint) rigid transformations
         for all the joints
     """
-    # with record_function("brt_setup"):
     joints = torch.unsqueeze(joints, dim=-1)
     rel_joints = joints.clone().contiguous()
     rel_joints[:, 1:] = rel_joints[:, 1:] - joints[:, parents[1:]]

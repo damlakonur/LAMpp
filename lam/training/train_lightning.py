@@ -47,7 +47,7 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
-from lam.dataset.cafca_lam_de_dataset import CafcaLamDataset
+from lam.dataset.cafca_lam_de_dataset_static import CafcaLamDataset
 from lam.training.lightning_lam_cafca import LamLightningModel 
 
 # Local get_logger definition for this script
@@ -124,7 +124,7 @@ def train(cfg: DictConfig):
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=cfg.training.batch_size,
-            shuffle=True,
+            shuffle=False,
             generator=torch_gen,
             worker_init_fn=seed_worker,
             num_workers=2,

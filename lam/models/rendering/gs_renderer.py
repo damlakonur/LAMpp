@@ -55,6 +55,168 @@ import lam.models.rendering.utils.mesh_utils as mesh_utils
 from lam.models.rendering.utils.point_utils import depth_to_normal
 from pytorch3d.ops.interp_face_attrs import interpolate_face_attributes
 
+def visualize_gaussians_as_ellipsoids(
+    gs_model, 
+    save_path: str,
+    n_rings: int = 8,
+    n_sectors: int = 8,
+    scale_factor: float = 1.0,
+    opacity_threshold: float = 0.1,
+    max_gaussians: int = None,
+):
+    """
+    Visualize Gaussian primitives as ellipsoid meshes and save to OBJ file.
+    
+    Args:
+        gs_model: GaussianModel with xyz, rotation (quaternion), scaling, opacity, shs
+        save_path: Output path for OBJ file
+        n_rings: Number of latitude rings for ellipsoid mesh
+        n_sectors: Number of longitude sectors for ellipsoid mesh  
+        scale_factor: Additional scaling factor for ellipsoids
+        opacity_threshold: Only visualize Gaussians with opacity above this threshold
+        max_gaussians: If set, limit to this many Gaussians (for performance)
+    """
+    import os
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    
+    # Extract Gaussian attributes
+    xyz = gs_model.xyz.detach().cpu().numpy()  # [N, 3]
+    rotation = gs_model.rotation.detach().cpu().numpy()  # [N, 4] quaternion (w, x, y, z)
+    scaling = gs_model.scaling.detach().cpu().numpy()  # [N, 3]
+    opacity = gs_model.opacity.detach().cpu().numpy()  # [N, 1]
+    shs = gs_model.shs.detach().cpu().numpy()  # [N, K, 3] or [N, 3]
+    
+    # Get colors from SH DC term
+    if len(shs.shape) == 3:
+        colors = shs[:, 0, :]  # [N, 3]
+    else:
+        colors = shs[:, :3]  # [N, 3]
+    colors = np.clip(colors, 0, 1)
+    
+    # Filter by opacity
+    mask = opacity.squeeze() > opacity_threshold
+    xyz = xyz[mask]
+    rotation = rotation[mask]
+    scaling = scaling[mask]
+    colors = colors[mask]
+    
+    # Limit number of Gaussians if specified
+    if max_gaussians is not None and len(xyz) > max_gaussians:
+        indices = np.random.choice(len(xyz), max_gaussians, replace=False)
+        xyz = xyz[indices]
+        rotation = rotation[indices]
+        scaling = scaling[indices]
+        colors = colors[indices]
+    
+    print(f"[visualize_gaussians] Visualizing {len(xyz)} Gaussians as ellipsoids")
+    
+    # Generate unit sphere vertices and faces
+    sphere_verts = []
+    for i in range(n_rings + 1):
+        phi = np.pi * i / n_rings
+        for j in range(n_sectors):
+            theta = 2 * np.pi * j / n_sectors
+            x = np.sin(phi) * np.cos(theta)
+            y = np.sin(phi) * np.sin(theta)
+            z = np.cos(phi)
+            sphere_verts.append([x, y, z])
+    sphere_verts = np.array(sphere_verts)
+    
+    sphere_faces = []
+    for i in range(n_rings):
+        for j in range(n_sectors):
+            v0 = i * n_sectors + j
+            v1 = i * n_sectors + (j + 1) % n_sectors
+            v2 = (i + 1) * n_sectors + j
+            v3 = (i + 1) * n_sectors + (j + 1) % n_sectors
+            sphere_faces.append([v0, v2, v1])
+            sphere_faces.append([v1, v2, v3])
+    sphere_faces = np.array(sphere_faces)
+    
+    n_verts_per_ellipsoid = len(sphere_verts)
+    n_faces_per_ellipsoid = len(sphere_faces)
+    
+    # Quaternion to rotation matrix (w, x, y, z convention)
+    def quat_to_rotmat(q):
+        w, x, y, z = q[0], q[1], q[2], q[3]
+        R = np.array([
+            [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y],
+            [2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
+            [2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y]
+        ])
+        return R
+    
+    all_verts = []
+    all_faces = []
+    all_colors = []
+    
+    for i in range(len(xyz)):
+        # Get rotation matrix from quaternion
+        R = quat_to_rotmat(rotation[i])
+        
+        # Scale sphere to ellipsoid
+        S = np.diag(scaling[i] * scale_factor)
+        
+        # Transform vertices: first scale, then rotate, then translate
+        transformed_verts = (R @ S @ sphere_verts.T).T + xyz[i]
+        
+        # Offset face indices
+        offset_faces = sphere_faces + i * n_verts_per_ellipsoid
+        
+        all_verts.append(transformed_verts)
+        all_faces.append(offset_faces)
+        all_colors.extend([colors[i]] * n_verts_per_ellipsoid)
+    
+    all_verts = np.vstack(all_verts)
+    all_faces = np.vstack(all_faces)
+    all_colors = np.array(all_colors)
+    
+    # Save as OBJ with vertex colors (using material)
+    mtl_path = save_path.replace('.obj', '.mtl')
+    mtl_name = os.path.basename(mtl_path)
+    
+    with open(save_path, 'w') as f:
+        f.write(f"# Gaussian Ellipsoids Visualization\n")
+        f.write(f"# {len(xyz)} Gaussians, {len(all_verts)} vertices, {len(all_faces)} faces\n")
+        f.write(f"mtllib {mtl_name}\n")
+        
+        # Write vertices with colors (OBJ extension: v x y z r g b)
+        for v, c in zip(all_verts, all_colors):
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {c[0]:.4f} {c[1]:.4f} {c[2]:.4f}\n")
+        
+        # Write faces (1-indexed)
+        for face in all_faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+    
+    # Also save as PLY for better color support
+    ply_path = save_path.replace('.obj', '.ply')
+    with open(ply_path, 'w') as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(all_verts)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write(f"element face {len(all_faces)}\n")
+        f.write("property list uchar int vertex_indices\n")
+        f.write("end_header\n")
+        
+        for v, c in zip(all_verts, all_colors):
+            r, g, b = int(c[0]*255), int(c[1]*255), int(c[2]*255)
+            f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {r} {g} {b}\n")
+        
+        for face in all_faces:
+            f.write(f"3 {face[0]} {face[1]} {face[2]}\n")
+    
+    print(f"[visualize_gaussians] Saved ellipsoid mesh to: {save_path}")
+    print(f"[visualize_gaussians] Saved PLY with colors to: {ply_path}")
+    
+    return save_path, ply_path
+
+
 inverse_sigmoid = lambda x: np.log(x / (1 - x))
 
 
@@ -433,6 +595,7 @@ class GS3DRenderer(nn.Module):
                  teeth_bs_flag=False,
                  oral_mesh_flag=False,
                  num_gaussians_per_vertex=1,
+                 is_finetuning=False,
                  **kwargs,
                  ):
         super().__init__()
@@ -446,6 +609,7 @@ class GS3DRenderer(nn.Module):
         self.oral_mesh_flag = oral_mesh_flag
         self.render_rgb = kwargs.get("render_rgb", True)
         self.num_gaussians_per_vertex = num_gaussians_per_vertex
+        self.is_finetuning = is_finetuning
         print("==="*16*3, f"\n Render rgb: {self.render_rgb}, Gaussians per vertex: {self.num_gaussians_per_vertex} \n"+"==="*16*3)
         
         self.scaling_modifier = 1.0
@@ -474,23 +638,13 @@ class GS3DRenderer(nn.Module):
 
         self.mlp_network_config = mlp_network_config
         if self.mlp_network_config is not None:
-            if num_gaussians_per_vertex == 1:
-                # Single MLP
-                self.mlp_net = MLP(query_dim, query_dim, **self.mlp_network_config)
-            else:
-                # Multiple MLPs with perturbation - this is where the real learned features are processed!
-                self.mlp_nets = nn.ModuleList()
-                
-                # First MLP: original (preserves learned weights)
-                base_mlp = MLP(query_dim, query_dim, **self.mlp_network_config)
-                self.mlp_nets.append(base_mlp)
-                
-                # Additional MLPs: perturbed copies
-                for i in range(1, num_gaussians_per_vertex):
-                    perturbed_mlp = self._create_perturbed_mlp(base_mlp)
-                    self.mlp_nets.append(perturbed_mlp)
+            # Always create MLPs as a ModuleList for consistency
+            self.mlp_nets = nn.ModuleList()
+            
+            # First MLP: original (preserves learned weights)
+            self.mlp_net = MLP(query_dim, query_dim, **self.mlp_network_config)
 
-        init_scaling = -5.0
+        init_scaling = -7.0  # Smaller initial Gaussians: exp(-7) ≈ 0.0009 vs exp(-5) ≈ 0.0067
         # Single gs_net - same for all gaussians (just converts features to attributes)
         self.gs_net = GSLayer(in_channels=query_dim,
                               use_rgb=use_rgb,
@@ -506,14 +660,21 @@ class GS3DRenderer(nn.Module):
                               fix_rotation=fix_rotation,
                               use_fine_feat=True if decode_with_extra_info is not None and decode_with_extra_info["type"] is not None else False,
                               )
+        
+    def build_mlps(self):
+        if self.num_gaussians_per_vertex != 1:
+            # Additional MLPs: perturbed copies
+            self.mlp_nets.append(self.mlp_net)
+            for i in range(1, self.num_gaussians_per_vertex):
+                perturbed_mlp = self._create_perturbed_mlp(self.mlp_nets[0])
+                self.mlp_nets.append(perturbed_mlp)
 
     def _create_perturbed_mlp(self, base_mlp):
         """Create a perturbed copy of the MLP with small weight variations"""
         import copy
         perturbed_mlp = copy.deepcopy(base_mlp)
-        
-        # Small perturbations to MLP weights
-        noise_scale = 0.005
+
+        noise_scale = 0.0001
         
         with torch.no_grad():
             for name, param in perturbed_mlp.named_parameters():
@@ -604,118 +765,92 @@ class GS3DRenderer(nn.Module):
         }
 
         return ret
+    
+    def animate_gs_model_finetuning(self, gs_attr: GaussianModel, flame_data):
+        num_view = flame_data["expr"].shape[0]
+        num_gaussians_per_vertex = getattr(gs_attr, 'num_gaussians_per_vertex', 1)
+
+        expr = flame_data["expr"]
+        shape = flame_data["betas"].repeat(num_view, 1)
+
+        # compute transforms once from base mesh
+        A = self.flame_model.get_cano_transform(
+            shape=shape,
+            expr=expr,
+            rotation=flame_data["rotation"],
+            neck=flame_data["neck_pose"],
+            jaw=flame_data["jaw_pose"],
+            eyes=flame_data["eyes_pose"],
+            batch_size=shape.shape[0],
+        )
+
+        # canonical gaussians for all (V*K,3)
+        mean_3d = gs_attr.xyz.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, V*K, 3]
+
+        ret = self.flame_model.animation_forward_finetuning(
+            v_cano=mean_3d,
+            expr=expr,
+            translation=flame_data["translation"],
+            batch_size=shape.shape[0],
+            A=A,
+            num_gaussians_per_vertex=num_gaussians_per_vertex,
+        )
+        mean_3d = ret["animated"]  # [Nv, V*K, 3]
+
+        # build per-view GaussianModels
+        gs_attr_list = []
+        for i in range(num_view):
+            gs_attr_copy = GaussianModel(
+                xyz=mean_3d[i],
+                opacity=gs_attr.opacity,
+                rotation=gs_attr.rotation,
+                scaling=gs_attr.scaling,
+                shs=gs_attr.shs,
+                offset=gs_attr.offset,
+            )
+            gs_attr_list.append(gs_attr_copy)
+
+        return gs_attr_list
             
     def animate_gs_model(self, gs_attr: GaussianModel, query_points, flame_data, debug=False):
         """
-        query_points: [V, 3] - FLAME vertex positions
-        gs_attr.xyz: [V*K, 3] if multiple gaussians, [V, 3] if single
+        query_points: [N, 3]
         """
         device = gs_attr.xyz.device
-        
-        # Check if we have multiplied gaussians
-        num_gaussians_per_vertex = getattr(gs_attr, 'num_gaussians_per_vertex', 1)
-        V = query_points.shape[0]  # Number of FLAME vertices
-        
-        if debug:
-            N = gs_attr.xyz.shape[0]
-            gs_attr.xyz = torch.ones_like(gs_attr.xyz) * 0.0
-            
-            rotation = matrix_to_quaternion(torch.eye(3).float()[None, :, :].repeat(N, 1, 1)).to(device) # constant rotation
-            opacity = torch.ones((N, 1)).float().to(device) # constant opacity
-
-            gs_attr.opacity = opacity
-            gs_attr.rotation = rotation
-
-        # Original behavior when num_gaussians_per_vertex == 1
-        if num_gaussians_per_vertex == 1:
-            with torch.autocast(device_type=device.type, dtype=torch.float32):
-                mean_3d = gs_attr.xyz  # [V, 3]
-                
-                num_view = flame_data["expr"].shape[0]  # [Nv, 100]
-                mean_3d = mean_3d.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, V, 3]
-                query_points = query_points.unsqueeze(0).repeat(num_view, 1, 1)
-
-                if self.teeth_bs_flag:
-                    expr = torch.cat([flame_data['expr'], flame_data['teeth_bs']], dim=-1)
-                else:
-                    expr = flame_data["expr"]
-                ret = self.flame_model.animation_forward(v_cano=mean_3d,
-                                                    shape=flame_data["betas"].repeat(num_view, 1),
-                                                    expr=expr,
-                                                    rotation=flame_data["rotation"],
-                                                    neck=flame_data["neck_pose"],
-                                                    jaw=flame_data["jaw_pose"],
-                                                    eyes=flame_data["eyes_pose"],
-                                                    translation=flame_data["translation"],
-                                                    zero_centered_at_root_node=False,
-                                                    return_landmarks=False,
-                                                    return_verts_cano=False,
-                                                    static_offset=None,
-                                                    )
-                mean_3d = ret["animated"]
-                
-            gs_attr_list = []                                                                  
-            for i in range(num_view):
-                gs_attr_copy = GaussianModel(xyz=mean_3d[i],
-                                        opacity=gs_attr.opacity, 
-                                        rotation=gs_attr.rotation, 
-                                        scaling=gs_attr.scaling,
-                                        shs=gs_attr.shs,
-                                        offset=gs_attr.offset)
-                gs_attr_list.append(gs_attr_copy)
-            
-            return gs_attr_list
-        
-        # Multi-gaussian behavior when > 1
-        # We have V*K gaussians, need to map them back to V FLAME vertices
-        all_gaussian_positions = gs_attr.xyz.view(V, num_gaussians_per_vertex, 3)  # [V, K, 3]
-        
-        # Calculate offsets from each gaussian to its parent FLAME vertex
-        flame_vertices_expanded = query_points.unsqueeze(1).repeat(1, num_gaussians_per_vertex, 1)  # [V, K, 3]
-        local_offsets = all_gaussian_positions - flame_vertices_expanded  # [V, K, 3]
 
         with torch.autocast(device_type=device.type, dtype=torch.float32):
-            num_view = flame_data["expr"].shape[0]
+            # mean_3d = query_points + gs_attr.xyz  # [N, 3]
+            mean_3d = gs_attr.xyz  # [N, 3]
             
-            # Animate FLAME vertices
-            flame_vertices_anim = query_points.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, V, 3]
+            num_view = flame_data["expr"].shape[0]  # [Nv, 100]
+            mean_3d = mean_3d.unsqueeze(0).repeat(num_view, 1, 1)  # [Nv, N, 3]
+            query_points = query_points.unsqueeze(0).repeat(num_view, 1, 1)
+
+            expr = flame_data["expr"]
+            ret = self.flame_model.animation_forward(v_cano=mean_3d,
+                                                shape=flame_data["betas"].repeat(num_view, 1),
+                                                expr=expr,
+                                                rotation=flame_data["rotation"],
+                                                neck=flame_data["neck_pose"],
+                                                jaw=flame_data["jaw_pose"],
+                                                eyes=flame_data["eyes_pose"],
+                                                translation=flame_data["translation"],
+                                                zero_centered_at_root_node=False,
+                                                return_landmarks=False,
+                                                return_verts_cano=False,
+                                                # static_offset=flame_data['static_offset'].to('cuda'),
+                                                static_offset=None,
+                                                )
+            mean_3d = ret["animated"]
             
-            if self.teeth_bs_flag:
-                expr = torch.cat([flame_data['expr'], flame_data['teeth_bs']], dim=-1)
-            else:
-                expr = flame_data["expr"]
-                
-            ret = self.flame_model.animation_forward(
-                v_cano=flame_vertices_anim,  # Only FLAME vertices! [Nv, V, 3]
-                shape=flame_data["betas"].repeat(num_view, 1),
-                expr=expr,
-                rotation=flame_data["rotation"],
-                neck=flame_data["neck_pose"],
-                jaw=flame_data["jaw_pose"],
-                eyes=flame_data["eyes_pose"],
-                translation=flame_data["translation"],
-                zero_centered_at_root_node=False,
-                return_landmarks=False,
-                return_verts_cano=False,
-                static_offset=None,
-            )
-            animated_flame_vertices = ret["animated"]  # [Nv, V, 3]
-        
-        gs_attr_list = []
+        gs_attr_list = []                                                                  
         for i in range(num_view):
-            # Apply FLAME animation + local offsets to get all gaussian positions
-            animated_flame_curr = animated_flame_vertices[i].unsqueeze(1).repeat(1, num_gaussians_per_vertex, 1)  # [V, K, 3]
-            final_gaussian_positions = animated_flame_curr + local_offsets  # [V, K, 3]
-            final_positions_flat = final_gaussian_positions.view(-1, 3)  # [V*K, 3]
-                
-            gs_attr_copy = GaussianModel(
-                xyz=final_positions_flat,
-                opacity=gs_attr.opacity, 
-                rotation=gs_attr.rotation, 
-                scaling=gs_attr.scaling,
-                shs=gs_attr.shs,
-                offset=gs_attr.offset
-            )
+            gs_attr_copy = GaussianModel(xyz=mean_3d[i],
+                                    opacity=gs_attr.opacity, 
+                                    rotation=gs_attr.rotation, 
+                                    scaling=gs_attr.scaling,
+                                    shs=gs_attr.shs,
+                                    offset=gs_attr.offset) # [N, 3]
             gs_attr_list.append(gs_attr_copy)
         
         return gs_attr_list
@@ -772,6 +907,20 @@ class GS3DRenderer(nn.Module):
                 # positions, _, transform_mat_neutral_pose = self.flame_model.get_query_points(flame_data, device=device)  # [B, N, 3]
                 positions = self.flame_model.get_cano_verts(shape_params=flame_data["betas"])  # [B, N, 3]
                 mesh = Meshes(positions, self.flame_model.faces_up.expand(positions.shape[0], -1, -1))
+                
+                # # Save mesh(es) to OBJ file
+                # import trimesh
+                # os.makedirs("debug_meshes", exist_ok=True)
+                # batch_size = positions.shape[0]
+                # for b in range(batch_size):
+                #     verts_np = positions[b].detach().cpu().numpy()  # [N, 3]
+                #     faces_np = self.flame_model.faces_up.detach().cpu().numpy()  # [F, 3]
+                    
+                #     # Create trimesh object and save
+                #     mesh_obj = trimesh.Trimesh(vertices=verts_np, faces=faces_np, process=False)
+                #     mesh_obj.export(f"debug_meshes/flame_canonical_batch{b}.obj")
+                #     print(f"Saved mesh to debug_meshes/flame_canonical_batch{b}.obj")
+                
                 # print(f"positions shape:{positions.shape}")
                 
         return positions, flame_data, mesh.verts_normals_packed().view_as(positions), self.flame_model.faces_up
@@ -812,7 +961,7 @@ class GS3DRenderer(nn.Module):
             out_list.append(self.forward_single_view(
                                 gs_list[v_idx], 
                                 Camera.from_c2w(w2c, intrinsic, height, width),
-                                background_color[v_idx] if background_color is not None else torch.tensor([0.,0.,0.], device=self.device),
+                                background_color[v_idx]
                             ))
         
         out = defaultdict(list)
@@ -903,7 +1052,11 @@ class GS3DRenderer(nn.Module):
             gs_model = gs_model_list[b]
             query_pt = query_points[b]
             # with torch.autograd.profiler.record_function("animate_gs_model"):
-            animatable_gs_model_list: list[GaussianModel] = self.animate_gs_model(gs_model,
+            if self.is_finetuning:
+                animatable_gs_model_list: list[GaussianModel] = self.animate_gs_model_finetuning(gs_model,
+                                                                                                self.get_sing_batch_smpl_data(flame_data, b))
+            else:
+                animatable_gs_model_list: list[GaussianModel] = self.animate_gs_model(gs_model,
                                                                                   query_pt,
                                                                                   self.get_sing_batch_smpl_data(flame_data, b),
                                                                                   debug=debug)
@@ -982,7 +1135,22 @@ class GS3DRenderer(nn.Module):
         # with torch.autograd.profiler.record_function("forward_gs"):
         gs_model_list, query_points, flame_data, query_gs_features = self.forward_gs(gs_hidden_features, query_points, flame_data=flame_data,
                                                                       additional_features=additional_features, debug=debug)
-        # with torch.autograd.profiler.record_function("forward_animate_gs"):
+        # breakpoint()
+        # # if os.environ.get("VIS_CANONICAL_GAUSSIANS", "0") == "1":
+        # vis_dir = os.environ.get("VIS_CANONICAL_GAUSSIANS_DIR", "./debug_vis/canonical_gaussians")
+        # os.makedirs(vis_dir, exist_ok=True)
+        # for b_idx, gs_model in enumerate(gs_model_list):
+        #     save_path = os.path.join(vis_dir, f"canonical_gaussians_batch{b_idx}.obj")
+        #     visualize_gaussians_as_ellipsoids(
+        #         gs_model,
+        #         save_path=save_path,
+        #         n_rings=8,
+        #         n_sectors=8,
+        #         scale_factor=3.0,  # Scale up ellipsoids for visibility
+        #         opacity_threshold=0.0,
+        #         max_gaussians=None,  # Set to e.g. 5000 for faster visualization
+        #     )
+        # breakpoint()
         out = self.forward_animate_gs(gs_model_list, query_points, flame_data, w2c, intrinsic, height, width, background_color, debug)
         
         return out

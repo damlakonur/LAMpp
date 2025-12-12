@@ -815,6 +815,42 @@ class FlameHeadSubdivided(FlameHead):
         
         return v_shaped
 
+    def animation_forward_finetuning(self,
+        v_cano,              # [B, V*K, 3]
+        expr,                # [B, D]
+        translation,         # [B, 3]
+        batch_size,
+        A,                   # [B, J, 4, 4]
+        num_gaussians_per_vertex=1,
+    ):
+        K = num_gaussians_per_vertex
+
+        # --- expand shapedirs_up and lbs_weights_up to match V*K ---
+        if K > 1:
+            shapedirs_up_exp = self.shapedirs_up.repeat(num_gaussians_per_vertex, 1, 1)
+            lbs_weights_up_exp = self.lbs_weights_up.repeat(num_gaussians_per_vertex, 1)
+        else:
+            shapedirs_up_exp = self.shapedirs_up
+            lbs_weights_up_exp = self.lbs_weights_up
+
+        # --- add expression contribution ---
+        v_cano_with_expr = v_cano + blend_shapes(expr, shapedirs_up_exp[:, :, self.n_shape_params:])
+
+        # --- skinning ---
+        vertices = self.skinning(
+            v_posed=v_cano_with_expr,
+            A=A,
+            lbs_weights=lbs_weights_up_exp,
+            batch_size=batch_size,
+            num_joints=self.joint_num,
+            dtype=self.dtype,
+            device=v_cano.device,
+        )
+
+        vertices = vertices + translation[:, None, :]
+
+        return {"animated": vertices}  # [B, V*K, 3]
+    
     def animation_forward(self,
         v_cano,
         shape,
@@ -830,30 +866,17 @@ class FlameHeadSubdivided(FlameHead):
         static_offset=None,
         dynamic_offset=None,
     ):
-        assert self.add_shoulder == False
-        assert static_offset is None
-
         batch_size = shape.shape[0]
 
         # step1. get animated_joint and corresponding transformed mat (Note not in upsampled space)
         betas = torch.cat([shape, expr], dim=1)
         full_pose = torch.cat([rotation, neck, jaw, eyes], dim=1)
 
-        if(self.add_shoulder):
-            template_vertices = self.v_template[:(self.v_template.shape[0]-self.v_shoulder.shape[0])].unsqueeze(0).expand(batch_size, -1, -1)
-        else:
-            template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
+        template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
         
         # Add shape contribution
         # with record_function("blend_shapes_step1"):
         v_shaped = template_vertices + blend_shapes(betas, self.shapedirs)
-
-        # Add personal offsets
-        if static_offset is not None:
-            if (self.add_shoulder):
-                v_shaped += static_offset[:,:(self.v_template.shape[0]-self.v_shoulder.shape[0])]
-            else:
-                v_shaped += static_offset
 
         A, J = self.get_transformed_mat(pose=full_pose, v_shaped=v_shaped, posedirs=self.posedirs, parents_list_cpu=self.parents_list_cpu,
                                         parents=self.parents, J_regressor=self.J_regressor, pose2rot=True, 
@@ -867,67 +890,37 @@ class FlameHeadSubdivided(FlameHead):
         # with record_function("skinning_step3"):
         vertices = self.skinning(v_posed=v_cano_with_expr, A=A, lbs_weights=self.lbs_weights_up, batch_size=batch_size,
                                  num_joints=self.joint_num, dtype=self.dtype, device=full_pose.device)
-        
-        if (self.add_shoulder):
-            v_shaped = torch.cat([v_shaped, self.v_template[(self.v_template.shape[0] - self.v_shoulder.shape[0]):].unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
-            vertices = torch.cat([vertices, self.v_template[(self.v_template.shape[0] - self.v_shoulder.shape[0]):].unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
-
-        if zero_centered_at_root_node:
-            vertices = vertices - J[:, [0]]
-            J = J - J[:, [0]]
 
         vertices = vertices + translation[:, None, :]
         J = J + translation[:, None, :]
 
         ret_vals = {}
         ret_vals["animated"] =vertices
-
-        if return_verts_cano:
-            ret_vals["cano"] = v_cano
-            ret_vals["cano_with_expr"] = v_cano_with_expr
-
-        # compute landmarks if desired
-        if return_landmarks:
-            bz = vertices.shape[0]
-            landmarks = vertices2landmarks(
-                vertices,
-                self.faces,
-                self.full_lmk_faces_idx.repeat(bz, 1),
-                self.full_lmk_bary_coords.repeat(bz, 1, 1),
-            )
-            ret_vals["landmarks"] = landmarks
         
         return ret_vals
     
+    def get_cano_transform(self, shape, expr, rotation, neck, jaw, eyes, batch_size):
+        betas = torch.cat([shape, expr], dim=1)
+        full_pose = torch.cat([rotation, neck, jaw, eyes], dim=1)
+
+        template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        v_shaped = template_vertices + blend_shapes(betas, self.shapedirs)
+        A, _ = self.get_transformed_mat(pose=full_pose, v_shaped=v_shaped, posedirs=self.posedirs, parents_list_cpu=self.parents_list_cpu,
+                                        parents=self.parents, J_regressor=self.J_regressor, pose2rot=True, 
+                                        dtype=self.dtype)
+
+        return A
+    
+    
     def get_transformed_mat(self, pose, v_shaped, posedirs, parents_list_cpu, parents, J_regressor, pose2rot, dtype):
-        # with record_function("get_transformed_mat_entry"):
         batch_size = pose.shape[0]
-        device = pose.device
 
-        # with record_function("get_transformed_mat_vertices2joints"):
         J = vertices2joints(J_regressor, v_shaped)
+        rot_mats = batch_rodrigues(pose.view(-1, 3), dtype=dtype).view(
+            [batch_size, -1, 3, 3]
+        )
 
-        # with record_function("get_transformed_mat_pose_blendshapes"):
-        ident = torch.eye(3, dtype=dtype, device=device)
-        if pose2rot:
-            rot_mats = batch_rodrigues(pose.view(-1, 3), dtype=dtype).view(
-                [batch_size, -1, 3, 3]
-            )
-
-            pose_feature = (rot_mats[:, 1:, :, :] - ident).view([batch_size, -1])
-            # (N x P) x (P, V * 3) -> N x V x 3
-            pose_offsets = torch.matmul(pose_feature, posedirs).view(batch_size, -1, 3)
-        else:
-            pose_feature = pose[:, 1:].view(batch_size, -1, 3, 3) - ident
-            rot_mats = pose.view(batch_size, -1, 3, 3)
-
-            pose_offsets = torch.matmul(pose_feature.view(batch_size, -1), posedirs).view(
-                batch_size, -1, 3
-            )
-
-        v_posed = pose_offsets + v_shaped
-
-        # with record_function("get_transformed_mat_batch_rigid_transform"):
         J_transformed, A = batch_rigid_transform(rot_mats, J, parents_list_cpu, parents, dtype=dtype)
         
         return A, J_transformed
@@ -949,87 +942,6 @@ class FlameHeadSubdivided(FlameHead):
         verts = v_homo[:, :, :3, 0]
         
         return verts
-
-    def inverse_animation(self,
-        v_pose,
-        shape,
-        expr,
-        rotation,
-        neck,
-        jaw,
-        eyes,
-        translation,
-        zero_centered_at_root_node=False,  # otherwise, zero centered at the face
-        return_landmarks=True,
-        return_verts_cano=False,
-        static_offset=None,
-        dynamic_offset=None,
-    ):
-        assert self.add_shoulder == False
-        assert static_offset is None
-
-        batch_size = shape.shape[0]
-
-        # step1. get animated_joint and corresponding transformed mat (Note not in upsampled space)
-        betas = torch.cat([shape, expr], dim=1)
-        full_pose = torch.cat([rotation, neck, jaw, eyes], dim=1)
-
-        if(self.add_shoulder):
-            template_vertices = self.v_template[:(self.v_template.shape[0]-self.v_shoulder.shape[0])].unsqueeze(0).expand(batch_size, -1, -1)
-        else:
-            template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
-        
-        # Add shape contribution
-        v_shaped = template_vertices + blend_shapes(betas, self.shapedirs)
-
-        # Add personal offsets
-        if static_offset is not None:
-            if (self.add_shoulder):
-                v_shaped += static_offset[:,:(self.v_template.shape[0]-self.v_shoulder.shape[0])]
-            else:
-                v_shaped += static_offset
-
-        A, J = self.get_transformed_mat(pose=full_pose, v_shaped=v_shaped, posedirs=self.posedirs,
-                                        parents=self.parents, J_regressor=self.J_regressor, pose2rot=True, 
-                                        dtype=self.dtype)
-
-        v_pose = v_pose - translation[:, None, :]
-
-        # inverse lbs
-        v_cano_with_expr = self.inverse_skinning(v_posed=v_pose, A=A, lbs_weights=self.lbs_weights_up, batch_size=batch_size,
-                                 num_joints=self.joint_num, dtype=self.dtype, device=full_pose.device)
-
-        # step2. v_cano
-        v_cano = v_cano_with_expr - blend_shapes(expr, self.shapedirs_up[:, :, self.n_shape_params:])
-
-        # step3. lbs
-        if (self.add_shoulder):
-            v_shaped = torch.cat([v_shaped, self.v_template[(self.v_template.shape[0] - self.v_shoulder.shape[0]):].unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
-            v_cano = torch.cat([v_cano, self.v_template[(self.v_template.shape[0] - self.v_shoulder.shape[0]):].unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
-
-        if zero_centered_at_root_node:
-            v_cano = v_cano - J[:, [0]]
-            J = J - J[:, [0]]
-
-
-        ret_vals = {}
-        ret_vals["cano"] = v_cano
-
-        if return_verts_cano:
-            ret_vals["cano_with_expr"] = v_cano_with_expr
-
-        # compute landmarks if desired
-        if return_landmarks:
-            bz = v_cano.shape[0]
-            landmarks = vertices2landmarks(
-                v_cano,
-                self.faces,
-                self.full_lmk_faces_idx.repeat(bz, 1),
-                self.full_lmk_bary_coords.repeat(bz, 1, 1),
-            )
-            ret_vals["landmarks"] = landmarks
-        
-        return ret_vals
 
     def inverse_skinning(self, v_posed, A, lbs_weights, batch_size, num_joints, dtype, device):
         
@@ -1078,60 +990,37 @@ class FlameHeadSubdivided(FlameHead):
         betas = torch.cat([shape, expr], dim=1)
         full_pose = torch.cat([rotation, neck, jaw, eyes], dim=1)
 
-        if(self.add_shoulder):
-            template_vertices = self.v_template[:(self.v_template.shape[0]-self.v_shoulder.shape[0])].unsqueeze(0).expand(batch_size, -1, -1)
-        else:
-            template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
+        template_vertices = self.v_template.unsqueeze(0).expand(batch_size, -1, -1)
 
         # Add shape contribution
-        v_shaped_woexpr = template_vertices + blend_shapes(betas[:, :self.n_shape_params], self.shapedirs[:, :, :self.n_shape_params])
+        # v_shaped_woexpr = template_vertices + blend_shapes(betas[:, :self.n_shape_params], self.shapedirs[:, :, :self.n_shape_params])
         v_shaped = template_vertices + blend_shapes(betas, self.shapedirs)
 
 
-        # Add personal offsets
-        if static_offset is not None:
-            if (self.add_shoulder):
-                v_shaped += static_offset[:,:(self.v_template.shape[0]-self.v_shoulder.shape[0])]
-            else:
-                v_shaped += static_offset
-
-        A, J = self.get_transformed_mat(pose=full_pose, v_shaped=v_shaped, posedirs=self.posedirs,
+        A, _ = self.get_transformed_mat(pose=full_pose, v_shaped=v_shaped, posedirs=self.posedirs,
                                         parents=self.parents, J_regressor=self.J_regressor, pose2rot=True, 
                                         dtype=self.dtype)
 
         v_shaped_up = self.v_template_up.unsqueeze(0).expand(batch_size, -1, -1) + blend_shapes(betas, self.shapedirs_up)
         vertices = self.skinning(v_posed=v_shaped_up, A=A, lbs_weights=self.lbs_weights_up, batch_size=batch_size,
                                  num_joints=self.joint_num, dtype=self.dtype, device=full_pose.device)
-        
-        
-        if (self.add_shoulder):
-            v_shaped = torch.cat([v_shaped, self.v_template[(self.v_template.shape[0] - self.v_shoulder.shape[0]):].unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
-            vertices = torch.cat([vertices, self.v_template[(self.v_template.shape[0] - self.v_shoulder.shape[0]):].unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
-
-        if zero_centered_at_root_node:
-            vertices = vertices - J[:, [0]]
-            J = J - J[:, [0]]
+    
 
         vertices = vertices + translation[:, None, :]
-        J = J + translation[:, None, :]
 
         ret_vals = {}
         ret_vals["animated"] =vertices
 
-        if return_verts_cano:
-            ret_vals["cano"] = self.v_template_up.unsqueeze(0).expand(batch_size, -1, -1) + blend_shapes(betas[:, :self.n_shape_params], self.shapedirs_up[:, :, :self.n_shape_params])
-            ret_vals["cano_with_expr"] = v_shaped_up
-
-        # compute landmarks if desired
-        if return_landmarks:
-            bz = vertices.shape[0]
-            landmarks = vertices2landmarks(
-                vertices,
-                self.faces,
-                self.full_lmk_faces_idx.repeat(bz, 1),
-                self.full_lmk_bary_coords.repeat(bz, 1, 1),
-            )
-            ret_vals["landmarks"] = landmarks
+        # # compute landmarks if desired
+        # if return_landmarks:
+        #     bz = vertices.shape[0]
+        #     landmarks = vertices2landmarks(
+        #         vertices,
+        #         self.faces,
+        #         self.full_lmk_faces_idx.repeat(bz, 1),
+        #         self.full_lmk_bary_coords.repeat(bz, 1, 1),
+        #     )
+        #     ret_vals["landmarks"] = landmarks
         
         return ret_vals
 

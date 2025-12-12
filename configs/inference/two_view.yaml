@@ -1,16 +1,19 @@
 # model_name: ./exps/finetuned_lam_cafca_full_fused_average/lam_1view_overfitting       # folder with model.safetensors
 reference_images:
-  - assets/sample_input/cam_222200036.jpg
-  - assets/sample_input/cam_222200047.jpg     # 2nd reference    
+  - assets/images/cam_222200036.jpg
+  - assets/images/cam_222200047.jpg     # 2nd reference    
   # - /home/cafca_dataset/00080/00000_000/masked_images/C12.png
   # - /home/cafca_dataset/00080/00000_000/masked_images/C15.png
 
 experiment:
-  output_dir: "./exps/inference_mlp_plucker_real_data"
-  checkpoint: "./exps/finetuned_lam_cafca_full_fusion_mlp_plucker/lam_1view_overfitting/checkpoints/epoch=0119-val/total_loss=0.2498.ckpt"
-  motion_seqs_dir: "assets/sample_motion/export/Pen_Pineapple_Apple_Pen/"
-  # model_name: "exps/releases/lam/lam-20k/step_045500/"
+  output_dir: "./exps/fusion1_50_fixed_dataset_g_dupl_3_inference_real"
+  # checkpoint: "./exps/total_loss=0.2614.ckpt"
+  checkpoint: "./exps/fusion1_50_fixed_dataset_g_dupl_3/overfitting/checkpoints/epoch=0029-val/total_loss=0.1833.ckpt"
+  motion_seqs_dir: "assets/sample_motion/export/The_Shawshank_Redemption/"
+  model_name: "exps/releases/lam/lam-20k/step_045500/"
 model:
+  # instantiate_encoder: true
+  # instantiate_transformer: true
   transformer_dim: 1024
   transformer_layers: 10
   tf_grad_ckpt: true
@@ -34,20 +37,21 @@ model:
   gs_xyz_offset_max_step: 0.2
   gs_clip_scaling: 0.01
   scale_sphere: false
-  shape_param_dim: 10
-  expr_param_dim: 10
-  num_source_views: 2   
+  shape_param_dim: 300
+  expr_param_dim: 100
+  num_source_views: 2
   add_teeth: false
 
   fix_opacity: false
   fix_rotation: false
-  instantiate_encoder: true
-  instantiate_transformer: true
+  num_gaussians_per_vertex: 3
+  is_finetuning: true
 
   has_disc: false
 
   teeth_bs_flag: false
   oral_mesh_flag: false       # keep for ModelLAM construction
+
 
 training:
   image_size: 512

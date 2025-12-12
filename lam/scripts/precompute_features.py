@@ -79,6 +79,19 @@ def _build_model(cfg: DictConfig):
         logger.info("Fine-tuning mode: Freezing all parameters except renderer.mlp_net.")
         for name, param in model.named_parameters():
             param.requires_grad = False
+        
+        if hasattr(model, 'renderer') and hasattr(model.renderer, 'mlp_net') and model.renderer.mlp_net is not None:
+            for param in model.renderer.mlp_net.parameters():
+                param.requires_grad = True
+            logger.info("Unfroze parameters of model.renderer.mlp_net.")
+        # if hasattr(model, 'renderer') and hasattr(model.renderer, 'gs_net') and model.renderer.gs_net is not None:
+        #     for param in model.renderer.gs_net.parameters():
+        #         param.requires_grad = True
+        #     logger.info("Unfroze parameters of model.renderer.gs_net.")
+        else:
+            logger.warning("model.renderer.mlp_net not found or is None. "
+                            "No parameters specifically unfrozen for MLP fine-tuning. "
+                            "Ensure model config `gs_mlp_network_config` is set if MLP is expected.")
     return model
 
 def precompute_and_save_batch(
@@ -133,7 +146,8 @@ def precompute_and_save_batch(
         )
 
         # image_feats_target_dir = current_sample_subject_output_dir / "image_feats"
-        tokens_target_dir = current_sample_subject_output_dir / "tokens"
+        tokens_target_dir = current_sample_subject_output_dir / "tokens_20k"
+        # image_feats_target_dir = current_sample_subject_output_dir / "image_feats"
         # image_feats_target_dir.mkdir(parents=True, exist_ok=True)
         tokens_target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -165,12 +179,13 @@ def precompute_features_main(cfg: DictConfig):
         image_size=cfg.training.image_size,
         is_val=False
     )
+    print(f"Dataset size: {len(dataset)}.")
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.training.batch_size,
         shuffle=False,
         num_workers=cfg.training.num_workers,
-        pin_memory=True
+        pin_memory=False
     )
     logger.info(f"Dataset size: {len(dataset)}. Dataloader size: {len(dataloader)} batches.")
 

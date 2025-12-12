@@ -40,6 +40,55 @@ def build_model(cfg: DictConfig):
     
     return model
 
+def load_checkpoint_with_shape_mismatch_handling(checkpoint_path, cfg):
+    """
+    Load checkpoint while handling shape mismatches for FLAME model parameters.
+    """
+    # Load checkpoint manually
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint['state_dict']
+    
+    # Create model normally (let it load pretrained weights, we'll override them anyway)
+    lit = LamLightningModel(cfg)
+    model_state_dict = lit.state_dict()
+    # Only load fine-tuned parameters (MLP, GS net, fusion MLP)
+    # Skip frozen parameters (pcl_embed, flame_model, etc.)
+    trainable_keys = ['renderer.mlp_net', 'renderer.gs_net', 'fusion_mlp']
+    
+    filtered_state_dict = {}
+    loaded_count = 0
+    skipped_count = 0
+    
+    for k, v in state_dict.items():
+        # Check if this key corresponds to a trainable component
+        is_trainable = any(key in k for key in trainable_keys)
+        
+        if not is_trainable:
+            skipped_count += 1
+            continue
+            
+        if k in model_state_dict:
+            if model_state_dict[k].shape == v.shape:
+                filtered_state_dict[k] = v
+                loaded_count += 1
+                print(f"[INFO] Loaded {k} with shape {v.shape}")
+            else:
+                print(f"[WARN] Shape mismatch for {k}: ckpt {v.shape} != model {model_state_dict[k].shape}, parameter ignored")
+        else:
+            print(f"[WARN] Key {k} in checkpoint but not in model")
+    
+    print(f"\n{'='*60}")
+    print(f"LOADING SUMMARY:")
+    print(f"  Loaded finetuned params: {loaded_count}")
+    print(f"  Skipped frozen params: {skipped_count}")
+    print(f"{'='*60}\n")
+    
+    # Load the filtered state dict (your finetuned weights override everything)
+    lit.load_state_dict(filtered_state_dict, strict=False)
+    print(f"[INFO] Successfully loaded finetuned checkpoint from {checkpoint_path}")
+    
+    return lit
+
 
 def _compute_latent_tokens(
     model: ModelLAM,
@@ -146,7 +195,11 @@ def save_latent_points(
         # -------- latent token for this single view --------
         with torch.no_grad():
             flame_param_dict = {"betas": shape_param.unsqueeze(0).to(device)}
-            tok_single = _compute_latent_tokens(model, rgb.to(device), flame_param_dict)  # [1,N,D]
+            # Ensure rgb has batch dimension [B, C, H, W]
+            rgb_input = rgb.to(device)
+            if rgb_input.dim() == 3:
+                rgb_input = rgb_input.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
+            tok_single = _compute_latent_tokens(model, rgb_input, flame_param_dict)  # [1,N,D]
             tokens_list.append(tok_single)
 
 
@@ -208,6 +261,7 @@ def infer_video_with_latents(
     src_intrs_np = pack["src_intrs"]                             # [2,3,3]
     src_intrs = torch.from_numpy(src_intrs_np).float()
     src_w2cs = torch.eye(4).unsqueeze(0).repeat(2, 1, 1)        # identity
+    src_canon_2_cam = torch.eye(4).unsqueeze(0).repeat(2, 1, 1) # identity
     # -------- cfg & model --------
     cfg = OmegaConf.load(cfg_path)
     cfg.model["instantiate_encoder"] = False
@@ -216,8 +270,11 @@ def infer_video_with_latents(
     ckpt = cfg.experiment.checkpoint
     assert ckpt and Path(ckpt).exists(), "Checkpoint not found"
 
-    lit = LamLightningModel.load_from_checkpoint(ckpt).to(dev)
-    lit.eval()
+    lit = LamLightningModel.load_from_checkpoint(ckpt)
+    # lit = load_checkpoint_with_shape_mismatch_handling(ckpt, cfg)
+    # breakpoint()
+    
+    lit.eval().cuda()
 
     # -------- prepare motion sequence --------
     motion_seq = prepare_motion_seqs(
@@ -245,6 +302,7 @@ def infer_video_with_latents(
         "render_bg_colors": motion_seq["render_bg_colors"].to(dev),
         "flame_params": {k: v.to(dev) for k, v in motion_seq["flame_params"].items()},
         "latent_points": latent.to(dev),
+        "source_canon_2_cam": src_canon_2_cam.to(dev),
     }
 
     # -------- forward --------

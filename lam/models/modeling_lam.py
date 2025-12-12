@@ -18,12 +18,12 @@ import pyvista as pv
 import trimesh
 import cv2
 import numpy as np
-from pytorch3d.ops import mesh_face_areas_normals
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
     PerspectiveCameras, RasterizationSettings, MeshRasterizer
 )
 from collections import defaultdict
+import torch.nn as nn
 import numpy as np
 import torch
 import torch.nn as nn
@@ -57,7 +57,7 @@ class ModelLAM(nn.Module):
     Full model of the basic single-view large reconstruction model.
     """
     def __init__(self,
-                 transformer_dim: int, transformer_layers: int, transformer_heads: int,
+                 transformer_dim: int, transformer_layers: int,  transformer_heads: int,
                  transformer_type="cond",
                  tf_grad_ckpt=False,
                  encoder_grad_ckpt=False,
@@ -82,6 +82,7 @@ class ModelLAM(nn.Module):
                  instantiate_encoder=False,
                  instantiate_transformer=False,
                  num_gaussians_per_vertex=1,
+                 is_finetuning=False,
                  **kwargs,
                  ):
         super().__init__()
@@ -136,10 +137,13 @@ class ModelLAM(nn.Module):
             self.transformer = None
             
         # To fuse information from n-views
+        print(f"[DEBUG] num_source_views: {self.num_source_views}")
         if self.num_source_views > 1:
             # initialzie it with zeros
-            self.layer_norm = nn.LayerNorm(transformer_dim)
-            self.fusion_layer = nn.Linear(transformer_dim * self.num_source_views, transformer_dim)
+            # self.layer_norm = nn.LayerNorm(transformer_dim)
+            # self.fusion_layer = nn.Linear(transformer_dim * self.num_source_views, transformer_dim)
+            # nn.init.zeros_(self.fusion_layer.weight)
+            # nn.init.zeros_(self.fusion_layer.bias)
             
             # Method 2: Weighting-based fusion
             # hidden_dim = transformer_dim // 4  
@@ -148,7 +152,6 @@ class ModelLAM(nn.Module):
             #     nn.SiLU(),
             #     nn.Linear(hidden_dim, 1)  # scalar weight per point per view
             # )
-            # self.layer_norm = nn.LayerNorm(transformer_dim)
             # self.fusion_layer = nn.Linear(transformer_dim, transformer_dim)
             # nn.init.zeros_(self.fusion_layer.weight)
             # nn.init.zeros_(self.fusion_layer.bias)
@@ -158,12 +161,65 @@ class ModelLAM(nn.Module):
             # New: MLP-based fusion that leverages visibility scores and Plücker
             #      coordinates, followed by a self-attention refinement.
             # ------------------------------------------------------------------ #
-            # concat_dim = 2 * (transformer_dim + 6 + 1)  # latent + plücker(6) + vis(1)
-            # self.fusion_mlp = nn.Sequential(
-            #     nn.Linear(concat_dim, transformer_dim),
-            #     nn.SiLU(),
-            #     nn.Linear(transformer_dim, transformer_dim),
+            concat_dim = self.num_source_views * (transformer_dim + 6 + 1)  # latent + plücker(6) + vis(1)
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(concat_dim, transformer_dim),
+                nn.SiLU(),
+                nn.Linear(transformer_dim, transformer_dim),
+            )
+            
+            # # Cross-attention layer after fusion
+            # print(f"[DEBUG] Creating post_fusion_transformer with:")
+            # print(f"  - transformer_dim: {transformer_dim}")
+            # print(f"  - transformer_heads: {transformer_heads}")
+            # print(f"  - encoder_feat_dim: {encoder_feat_dim}")
+            # print(f"  - cond_dim: {encoder_feat_dim}")
+            
+            # self.post_fusion_transformer = TransformerDecoder(
+            #     block_type="sd3_cond",
+            #     num_layers=1,  # Only one layer for cross-attention
+            #     num_heads=transformer_heads,
+            #     inner_dim=transformer_dim, 
+            #     cond_dim=encoder_feat_dim,  # Each image feature has encoder_feat_dim, don't multiply by 2
+            #     mod_dim=None,
+            #     gradient_checkpointing=self.gradient_checkpointing,
             # )
+            # print(f"[DEBUG] post_fusion_transformer created successfully")
+            
+            # # Initialize the transformer to output zeros for stable training start
+            # self._initialize_transformer_to_zero()
+            
+            # # Count parameters in the new cross-attention layer
+            # ca_params = sum(p.numel() for p in self.post_fusion_transformer.parameters() if p.requires_grad)
+            # print(f"[DEBUG] Cross-attention layer has {ca_params:,} trainable parameters")
+            
+            # Self-attention layer after fusion (simple nn.MultiHeadAttention)
+            # print(f"[DEBUG] Creating post_fusion_self_attention with:")
+            # print(f"  - transformer_dim: {transformer_dim}")
+            # print(f"  - transformer_heads: {transformer_heads}")
+            
+            # # Use MultiheadAttention without batch_first for compatibility
+            # self.post_fusion_self_attention = nn.MultiheadAttention(
+            #     embed_dim=transformer_dim,
+            #     num_heads=32,
+            #     dropout=0.0,
+            #     bias=True
+            # )
+            
+            # Add layer normalization for stability
+            # self.pre_attention_norm = nn.LayerNorm(transformer_dim)
+            # self.post_attention_norm = nn.LayerNorm(transformer_dim)
+            # print(f"[DEBUG] post_fusion_self_attention created successfully")
+            
+            # # Initialize the self-attention to output zeros for stable training start
+            # self._initialize_multihead_attention_to_zero()
+            
+            # # Count parameters in the new self-attention layer
+            # sa_params = sum(p.numel() for p in self.post_fusion_self_attention.parameters() if p.requires_grad)
+            
+            # print(f"[DEBUG] Self-attention layer has {sa_params:,} trainable parameters")
+            # self._initialize_fusion_mlp_to_zero()
+            
         
         # renderer
         self.renderer = GS3DRenderer(human_model_path=human_model_path,
@@ -190,11 +246,76 @@ class ModelLAM(nn.Module):
                                      use_mesh_shading=kwargs.get('use_mesh_shading', False),
                                      render_rgb=kwargs.get("render_rgb", True),
                                      num_gaussians_per_vertex=num_gaussians_per_vertex,
+                                     is_finetuning=is_finetuning,
                                      )
 
     def get_last_layer(self):
         return self.renderer.gs_net.out_layers["shs"].weight
     
+    def _initialize_transformer_to_zero(self):
+        """Initialize the post-fusion transformer to output zeros for stable training start."""
+        if hasattr(self, 'post_fusion_transformer') and self.post_fusion_transformer is not None:
+            # Zero out the final output projection to make the transformer output zeros initially
+            for layer in self.post_fusion_transformer.layers:
+                # Handle SD3 transformer structure - zero out the final output projection
+                if hasattr(layer, 'attn') and hasattr(layer.attn, 'to_out'):
+                    to_out = layer.attn.to_out
+                    # Handle different types of output layers
+                    if isinstance(to_out, nn.Sequential):
+                        # Sequential case: zero the first Linear layer
+                        for module in to_out:
+                            if isinstance(module, nn.Linear):
+                                nn.init.zeros_(module.weight)
+                                if module.bias is not None:
+                                    nn.init.zeros_(module.bias)
+                                break
+                    elif isinstance(to_out, nn.ModuleList):
+                        # ModuleList case: zero the first Linear layer in the list
+                        for module in to_out:
+                            if isinstance(module, nn.Linear):
+                                nn.init.zeros_(module.weight)
+                                if module.bias is not None:
+                                    nn.init.zeros_(module.bias)
+                                break
+                    elif isinstance(to_out, nn.Linear):
+                        # Direct Linear layer
+                        nn.init.zeros_(to_out.weight)
+                        if to_out.bias is not None:
+                            nn.init.zeros_(to_out.bias)
+                
+                # Also zero out the feedforward output if it exists
+                if hasattr(layer, 'ff') and hasattr(layer.ff, 'net'):
+                    # Find the last linear layer in the feedforward network
+                    for module in reversed(list(layer.ff.net.modules())):
+                        if isinstance(module, nn.Linear):
+                            nn.init.zeros_(module.weight)
+                            if module.bias is not None:
+                                nn.init.zeros_(module.bias)
+                            break
+            
+            print("[DEBUG] Initialized post_fusion_transformer to output zeros")
+    
+    def _initialize_multihead_attention_to_zero(self):
+        """Initialize the MultiHeadAttention to output zeros for stable training start."""
+        if hasattr(self, 'post_fusion_self_attention') and self.post_fusion_self_attention is not None:
+            # Zero out the output projection to make the attention output zeros initially
+            if hasattr(self.post_fusion_self_attention, 'out_proj'):
+                nn.init.zeros_(self.post_fusion_self_attention.out_proj.weight)
+                if self.post_fusion_self_attention.out_proj.bias is not None:
+                    nn.init.zeros_(self.post_fusion_self_attention.out_proj.bias)
+            
+            print("[DEBUG] Initialized MultiHeadAttention to output zeros")
+            
+    def _initialize_fusion_mlp_to_zero(self):
+        """Initialize the fusion MLP to output zeros for stable training start."""
+        if hasattr(self, 'fusion_mlp') and self.fusion_mlp is not None:
+            for module in self.fusion_mlp:
+                if isinstance(module, nn.Linear):
+                    nn.init.zeros_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            print("[DEBUG] Initialized fusion MLP to output zeros")
+            
     @staticmethod
     def _encoder_fn(encoder_type: str):
         from .encoders.dinov2_fusion_wrapper import Dinov2FusionWrapper
@@ -355,6 +476,7 @@ class ModelLAM(nn.Module):
             grey    – from neither
         and saves an off-screen PNG.
         """
+        # w_raw_bool = front_mask * ray_vis.float()
         # verts = query_points[0].cpu().numpy()
         # faces = faces.cpu().numpy()
         # faces_pv = np.hstack([np.full((faces.shape[0], 1), 3), faces])
@@ -364,21 +486,21 @@ class ModelLAM(nn.Module):
         #     verts     = query_points[0],       # (N,3) torch
         #     ray_vis0   = w_raw_bool[0],               # (B,V,N) torch.bool
         #     cam_pos= cam_centers[0, 0].detach().cpu().numpy() ,
-        #     out_png   = "visibility_step2.png",
+        #     out_png   = "visibility_step4.png",
         # )
         # self.save_visibility_snapshot(
         #     mesh_pv      = mesh,     # pre-loaded PolyData
         #     verts     = query_points[1],       # (N,3) torch
         #     ray_vis0   = w_raw_bool[1],               # (B,V,N) torch.bool
         #     cam_pos= cam_centers[1, 0].detach().cpu().numpy() ,
-        #     out_png   = "visibility_step3.png",
+        #     out_png   = "visibility_step5.png",
         # )
 
         # breakpoint()
 
-        # 1. convert to numpy
-        vis_c00 = ray_vis0[0].cpu().numpy()
-        vis_c06 = ray_vis0[1].cpu().numpy()
+        # 1. convert to numpy and ensure boolean type
+        vis_c00 = ray_vis0[0].cpu().numpy().astype(bool)
+        vis_c06 = ray_vis0[1].cpu().numpy().astype(bool)
 
         if torch.is_tensor(verts):
             verts = verts.cpu().numpy()
@@ -393,10 +515,11 @@ class ModelLAM(nn.Module):
         p = pv.Plotter(off_screen=True, window_size=window)
         p.set_background("white")
         p.add_mesh(mesh_pv, color="lightgray", opacity=0.25, show_edges=False)
-        focal   = np.array([0.0, 0.0, 0.0])   # look-at target (e.g. scene origin)
-        view_up = np.array([0.0, 1.0, 0.0])   # camera's 'up' direction (Y-axis)
-
-        p.camera_position = [cam_pos, focal, view_up]
+        # Squeeze the extra dimension from cam_pos and create camera position in PyVista format
+        camera_pos = [(float(cam_pos[0,0]), float(cam_pos[0,1]), float(cam_pos[0,2])),  # camera position
+                     (0.0, 0.0, 0.0),                                                     # focal point at origin
+                     (0.0, 1.0, 0.0)]                                                     # view up vector
+        p.camera_position = camera_pos
         p.add_points(
             verts,
             scalars=colours,
@@ -415,14 +538,7 @@ class ModelLAM(nn.Module):
             query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(flame_params,
                                                                         device=render_w2cs.device)
         # #### The following part is important to obtain canonical-cam-params #####
-        axis_angle = flame_params["rotation"][:, 0, :]     # [B, 3]
-        translation = flame_params["translation"][:, 0, :]  # [B, 3]
-        R_c2w = axis_angle_to_matrix(axis_angle)  # [B, 3, 3]
-        p = torch.eye(4, dtype=translation.dtype, device=translation.device).unsqueeze(0).repeat(src_w2cs.shape[0], 1, 1)
-        p[:, :3, :3] = R_c2w
-        p[:, :3, 3] = translation
-        p_inv = torch.linalg.inv(p) 
-        src_w2cs = p_inv[:, None] @ src_w2cs       
+        src_w2cs = flame_params["canon_2_cam"][:, :2] @ src_w2cs       
         #########################################################################
 
         R_world2cam = src_w2cs[:, :, :3, :3]           # (B,V,3,3)
@@ -479,7 +595,105 @@ class ModelLAM(nn.Module):
             # 'latent_points': latent_points,
             **render_results,
         }
+
+    def forward_img_feats(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, img_feats):
+        """
+        Forward function that takes img_feats and produces latent points on-the-fly,
+        then uses forward1 for fusion and rendering.
         
+        Args:
+            src_w2cs: Source camera extrinsics [B, V, 4, 4]
+            src_intrs: Source camera intrinsics [B, V, 3, 3] 
+            render_w2cs: Render camera extrinsics [B, M, 4, 4]
+            render_intrs: Render camera intrinsics [B, M, 3, 3]
+            render_bg_colors: Background colors [B, M, 3]
+            flame_params: FLAME parameters dict
+            img_feats: Image features [B, V, H*W, C] from DinoV2
+        """
+        assert len(flame_params["betas"].shape) == 2
+        device = src_w2cs.device
+        
+        # Step 1: Get FLAME query points (same as forward_latent_points)
+        query_points = None
+        if self.latent_query_points_type.startswith("e2e_flame"):
+            query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(
+                flame_params, device=device)
+        
+        # Step 2: Generate latent points for each source view (simplified - no additional features)
+        # B, V = img_feats.shape[:2]
+        # all_latent_points = []
+        
+        # for v in range(V):
+        #     # Get single view image features [B, H*W, C] 
+        #     image_feats = img_feats[:, v]  
+            
+        #     assert image_feats.shape[-1] == self.encoder_feat_dim, \
+        #         f"Feature dimension mismatch: {image_feats.shape[-1]} vs {self.encoder_feat_dim}"
+            
+        #     # Keep it simple - no additional features, just set query_feats = None
+        #     query_feats = None
+            
+        #     # Generate latent points via transformer
+        #     tokens = self.forward_transformer(image_feats, camera_embeddings=None, query_points=query_points, query_feats=query_feats)
+        #     all_latent_points.append(tokens)
+        
+        # # Step 3: Stack latent points from all source views [B, V, N, C]
+        # latent_points = torch.stack(all_latent_points, dim=1)
+        B, V, S, C = img_feats.shape
+        image_feats_flat = img_feats.view(B * V, S, C)
+        query_points_flat = None
+        if query_points is not None:
+            query_points_flat = query_points.repeat_interleave(V, dim=0)
+
+        tokens = self.forward_transformer(
+            image_feats_flat,
+            camera_embeddings=None,
+            query_points=query_points_flat,
+            query_feats=None,
+        )  # [B*V, N, C]
+
+        latent_points = tokens.view(B, V, *tokens.shape[1:])  # [B, V, N, C]
+        
+        # Step 4: Use forward1 for fusion and rendering
+        return self.forward1(src_w2cs, src_intrs, render_w2cs, render_intrs, 
+                           render_bg_colors, flame_params, latent_points)
+        
+    def forward_avg(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points):
+        assert len(flame_params["betas"].shape) == 2
+        render_h, render_w = 512, 512
+        query_points = None
+        if self.latent_query_points_type.startswith("e2e_flame"):
+            query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(flame_params,
+                                                                        device=render_w2cs.device)
+        if latent_points.ndim >= 3 and self.num_source_views > 1:
+            avg_points = latent_points.mean(dim=1, keepdim=False)
+            latent_points = avg_points
+            
+
+        elif self.num_source_views == 1:
+            latent_points = latent_points.squeeze(1)
+
+        render_results = self.renderer(gs_hidden_features=latent_points,
+                                       query_points=query_points,
+                                       flame_data=flame_params,
+                                       w2c=render_w2cs,
+                                       intrinsic=render_intrs,
+                                       height=render_h,
+                                       width=render_w,
+                                       background_color=render_bg_colors,
+                                       additional_features=None
+        )
+
+        N, M = render_w2cs.shape[:2]
+        assert render_results['comp_rgb'].shape[0] in [N, N], "Batch size mismatch for render_results"
+        assert render_results['comp_rgb'].shape[1] in [M, M*2], "Number of rendered views should be consistent with render_cameras"
+
+        return {
+            # 'latent_points': latent_points,
+            **render_results,
+        }
+        
+    
     def forward1(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points):
         assert len(flame_params["betas"].shape) == 2
         render_h, render_w = 512, 512
@@ -528,7 +742,7 @@ class ModelLAM(nn.Module):
             query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(flame_params,
                                                                         device=render_w2cs.device)
         if latent_points.ndim >= 3 and self.num_source_views > 1:
-            avg_points = latent_points.mean(dim=1, keepdim=True)
+            avg_points = latent_points.mean(dim=1, keepdim=False)
             
             ############### second method #############
             latent_points = latent_points.float() 
@@ -536,7 +750,7 @@ class ModelLAM(nn.Module):
             weights = F.softmax(weights, dim=1) # softmax across views per-point
             aggregated_points = (latent_points * weights).sum(dim=1)
             latent_points = self.fusion_layer(aggregated_points) + avg_points
-            latent_points = self.layer_norm(latent_points).squeeze(1)
+            # latent_points = self.layer_norm(latent_points).squeeze(1)
             
 
         elif self.num_source_views == 1:
@@ -562,7 +776,7 @@ class ModelLAM(nn.Module):
             **render_results,
         }
         
-    def forward4(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
+    def forward4(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, src_canon_2_cam, image_feats=None, source_flame_params=None, render_images=None, data=None):
         assert len(flame_params["betas"].shape) == 2
         render_h, render_w = 512, 512
         query_points = None
@@ -571,16 +785,8 @@ class ModelLAM(nn.Module):
                                                                         device=render_w2cs.device)
         if latent_points.ndim >= 3 and self.num_source_views > 1:
             # #### The following part is important to obtain canonical-cam-params #####
-            axis_angle = flame_params["rotation"][:, 0, :]     # [B, 3]
-            translation = flame_params["translation"][:, 0, :]  # [B, 3]
-            R_c2w = axis_angle_to_matrix(axis_angle)  # [B, 3, 3]
-            p = torch.eye(4, dtype=translation.dtype, device=translation.device).unsqueeze(0).repeat(src_w2cs.shape[0], 1, 1)
-            p[:, :3, :3] = R_c2w
-            p[:, :3, 3] = translation
-            p_inv = torch.linalg.inv(p) 
-            src_w2cs = p_inv[:, None] @ src_w2cs       
+            src_w2cs = src_canon_2_cam @ src_w2cs        
             #########################################################################
-
             R_world2cam = src_w2cs[:, :, :3, :3]           # (B,V,3,3)
             T_world2cam = src_w2cs[:, :, :3, 3]            # (B,V,3)
             # cam_centers = src_w2cs[:, :, :3, 3] # when using cam2world
@@ -624,6 +830,50 @@ class ModelLAM(nn.Module):
             )  # [B, N, 2*(D+7)]
 
             latent_points = self.fusion_mlp(fuse_cat)   # [B, N, D]
+            # latent_points_avg = latent_points.mean(dim=1, keepdim=False)
+            # latent_points = latent_points_avg + latent_points_fused
+            
+            # Apply cross-attention with concatenated image features
+            # print(f"[DEBUG] image_feats is None: {image_feats is None}")
+            # if image_feats is not None:
+            #     # Concatenate image features from both source views
+            #     # image_feats should be [B, V, S, C] where V=2 for two source views
+            #     B, V, S, C = image_feats.shape
+            #     concat_img_feats = image_feats.view(B, V * S, C)  # [B, V*S, C] = [B, 2*S, C]
+                
+            #     # Apply cross-attention between fused latent points and concatenated image features
+            #     # print(f"[DEBUG] Applying cross-attention! latent_points: {latent_points.shape}, concat_img_feats: {concat_img_feats.shape}")
+            #     latent_points_ca = self.post_fusion_transformer(
+            #         latent_points,  # query: [B, N, D]
+            #         cond=concat_img_feats,  # key/value: [B, 2*S, C]
+            #         mod=None,
+            #     )  # [B, N, D]
+            #     # skip connection
+            #     latent_points = latent_points + latent_points_ca
+            #     # print(f"[DEBUG] Cross-attention completed! Output shape: {latent_points.shape}")
+            
+            # Apply self-attention with layer normalization for stability
+            # print(f"[DEBUG] Before self-attention: latent_points range [{latent_points.min():.6f}, {latent_points.max():.6f}], mean: {latent_points.mean():.6f}")
+            
+            # Pre-normalization for stability
+            # latent_points_normed = self.pre_attention_norm(latent_points)  # [B, N, D]
+            
+            # # MultiheadAttention expects [seq_len, batch, embed_dim] format
+            # latent_points_t = latent_points_normed.transpose(0, 1)  # [B, N, D] -> [N, B, D]
+            # latent_points_sa_t, _ = self.post_fusion_self_attention(
+            #     latent_points_t,  # query: [N, B, D]
+            #     latent_points_t,  # key: [N, B, D]  
+            #     latent_points_t,  # value: [N, B, D]
+            #     need_weights=False  # Don't return attention weights
+            # )
+            # latent_points_sa = latent_points_sa_t.transpose(0, 1)  # [N, B, D] -> [B, N, D]
+            
+            # # print(f"[DEBUG] Self-attention output: latent_points_sa range [{latent_points_sa.min():.6f}, {latent_points_sa.max():.6f}], mean: {latent_points_sa.mean():.6f}")
+            
+            # # Post-normalization and skip connection
+            # latent_points_sa_normed = self.post_attention_norm(latent_points_sa)
+            # latent_points = latent_points + latent_points_sa_normed
+            # print(f"[DEBUG] After skip connection: latent_points range [{latent_points.min():.6f}, {latent_points.max():.6f}], mean: {latent_points.mean():.6f}")
 
         elif self.num_source_views == 1:
             latent_points = latent_points.squeeze(1)
@@ -638,6 +888,85 @@ class ModelLAM(nn.Module):
                                        background_color=render_bg_colors,
                                        additional_features=None
         )
+        
+
+        N, M = render_w2cs.shape[:2]
+        assert render_results['comp_rgb'].shape[0] in [N, N], "Batch size mismatch for render_results"
+        assert render_results['comp_rgb'].shape[1] in [M, M*2], "Number of rendered views should be consistent with render_cameras"
+
+        return {
+            # 'latent_points': latent_points,
+            **render_results,
+        }
+        
+    def forward5(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, src_canon_2_cam, image_feats=None, source_flame_params=None, render_images=None, data=None):
+        assert len(flame_params["betas"].shape) == 2
+        render_h, render_w = 512, 512
+        query_points = None
+        if self.latent_query_points_type.startswith("e2e_flame"):
+            query_points, flame_params, surf_normals, faces = self.renderer.get_query_points(flame_params,
+                                                                        device=render_w2cs.device)
+        if latent_points.ndim >= 3 and self.num_source_views > 1:
+            # #### The following part is important to obtain canonical-cam-params #####
+            src_w2cs = src_canon_2_cam @ src_w2cs        
+            #########################################################################
+            R_world2cam = src_w2cs[:, :, :3, :3]           # (B,V,3,3)
+            T_world2cam = src_w2cs[:, :, :3, 3]            # (B,V,3)
+            # cam_centers = src_w2cs[:, :, :3, 3] # when using cam2world
+            ############ Visibility according to vertex normals #####################
+            cam_centers = extract_camera_centers(src_w2cs).unsqueeze(2)    # [B, V, 1, 3]
+            vertex_positions = query_points.unsqueeze(1)   # [B, 1, N, 3]
+            vertex_normals = surf_normals.unsqueeze(1)     # [B, 1, N, 3]
+            # rays from vertex toward camera
+            ray_dirs = cam_centers - vertex_positions      # [B, V, N, 3]
+            ray_dirs = torch.nn.functional.normalize(ray_dirs, dim=-1)
+            # front-facing mask
+            cos_theta  = (ray_dirs * vertex_normals).sum(-1)   # [B, V, N]
+            front_mask = (cos_theta > 0).float() 
+            ############### Visibility according to mesh rasterization ##############
+            ray_vis = self.vis_mask_rasterizer(   # [B,V,N]  
+                        verts=query_points,
+                        faces=faces,
+                        cam_R=R_world2cam,
+                        cam_T=T_world2cam.float(),
+                        K=src_intrs)
+            # 2. final per-vertex, per-view weight
+            w_raw = front_mask * ray_vis.float()                # [B,V,N]
+            # Compute Plücker coordinates for each camera-to-point ray            
+            cam_pos  = cam_centers.expand(-1, -1, ray_dirs.shape[2], -1)  # [B,2,N,3]
+            
+            l_vec    = ray_dirs                                         # already norm
+            m_vec    = torch.cross(cam_pos, l_vec, dim=-1)              # moment
+            plucker  = torch.cat([l_vec, m_vec], dim=-1)                # [B,2,N,6]
+            fuse_per_view = torch.cat([latent_points, plucker], dim=-1)  # [B,2,N,D+7]
+
+            # ------------------------------------------------------------------
+            # Concatenate the two views per point, let the MLP learn the fusion
+            # ------------------------------------------------------------------
+            fuse_cat = fuse_per_view.permute(0, 2, 1, 3).reshape(
+                fuse_per_view.size(0),  # B
+                fuse_per_view.size(2),  # N
+                -1                      # 2*(D+7)
+            )  # [B, N, 2*(D+7)]
+
+            latent_points_fused = self.fusion_mlp(fuse_cat)   # [B, N, D]
+            latent_points_avg = latent_points.mean(dim=1, keepdim=False)
+            latent_points = latent_points_avg + latent_points_fused
+            
+        elif self.num_source_views == 1:
+            latent_points = latent_points.squeeze(1)
+
+        render_results = self.renderer(gs_hidden_features=latent_points,
+                                       query_points=query_points,
+                                       flame_data=flame_params,
+                                       w2c=render_w2cs,
+                                       intrinsic=render_intrs,
+                                       height=render_h,
+                                       width=render_w,
+                                       background_color=render_bg_colors,
+                                       additional_features=None
+        )
+        
 
         N, M = render_w2cs.shape[:2]
         assert render_results['comp_rgb'].shape[0] in [N, N], "Batch size mismatch for render_results"
@@ -648,8 +977,11 @@ class ModelLAM(nn.Module):
             **render_results,
         }
     
-    def forward(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats=None, source_flame_params=None, render_images=None, data=None):
-        return self.forward1(src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points)
+    def forward(self, src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, src_canon_2_cam, latent_points=None, image_feats=None, source_flame_params=None, render_images=None, data=None):
+        # return self.forward_img_feats(src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, image_feats)
+        # return self.forward4(src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, image_feats)
+        return self.forward4(src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points, src_canon_2_cam)
+        # return self.forward1(src_w2cs, src_intrs, render_w2cs, render_intrs, render_bg_colors, flame_params, latent_points)
         
     @torch.no_grad()
     def infer_single_view(
