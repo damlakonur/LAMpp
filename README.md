@@ -28,10 +28,14 @@ The model introduce fusion_mlp to process two input images simultaneously, combi
 </div>
 
 **Output GIF** (comparison showing improved reconstruction quality with 2-view input):
+- **Left**: MV-LAM (2-view fusion)
+- **Right**: Original LAM (single-view)
+
 
 <div align="center">
   <img src="./output_99.gif" width="80%">
 </div>
+
 
 
 ### Configuration Files
