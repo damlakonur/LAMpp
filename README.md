@@ -27,11 +27,10 @@ The model introduce fusion_mlp to process two input images simultaneously, combi
   <img src="./assets/C14.jpg" width="45%">
 </div>
 
-**Output Video** (comparison showing improved reconstruction quality with 2-view input):
+**Output GIF** (comparison showing improved reconstruction quality with 2-view input):
 
 <div align="center">
-  <video controls src="./output_99.mp4" width="80%">
-  </video>
+  <img src="./output_99.gif" width="80%">
 </div>
 
 
